@@ -46,6 +46,10 @@ function findCookiesFile() {
   }
 }
 
+// 2025년 11월부터 유튜브는 JS 챌린지를 통과해야 오디오 포맷을 제대로 내려줍니다.
+// Node.js를 JS 실행 런타임으로 쓰도록 지정합니다 (Render 서버에 이미 Node.js가 있음).
+const JS_RUNTIME_ARGS = ['--js-runtimes', 'node', '--remote-components', 'ejs:github'];
+
 // 검색어 또는 유튜브 링크를 넣으면 { title, url }을 반환합니다.
 // url은 재생 시점에 다시 사용할 검색어/링크 원본입니다 (여기서는 제목만 빠르게 조회합니다).
 function getVideoTitle(query) {
@@ -56,6 +60,7 @@ function getVideoTitle(query) {
       '--skip-download',
       '--print',
       '%(title)s',
+      ...JS_RUNTIME_ARGS,
       '--default-search',
       'ytsearch1',
     ];
@@ -94,6 +99,7 @@ function createMusicStream(query) {
     '-',
     '--no-warnings',
     '--no-playlist',
+    ...JS_RUNTIME_ARGS,
     '--default-search',
     'ytsearch1',
   ];
@@ -541,7 +547,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await interaction.deferReply({ ephemeral: true });
     const testUrl = interaction.options.getString('링크') || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
     const cookiesPath = findCookiesFile();
-    const args = ['-F', testUrl];
+    const args = ['-F', ...JS_RUNTIME_ARGS, testUrl];
     if (cookiesPath) args.push('--cookies', cookiesPath);
 
     execFile(YTDLP_PATH, args, { maxBuffer: 1024 * 1024 * 5, timeout: 30_000 }, (error, stdout, stderr) => {
