@@ -181,4 +181,12 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   }
 });
 
+// 진단용: 토큰이 실제로 전달되는지 확인 (토큰 내용 자체는 출력하지 않습니다)
+const tokenCheck = process.env.DISCORD_TOKEN;
+if (!tokenCheck) {
+  console.log('❌ DISCORD_TOKEN 환경변수를 찾을 수 없습니다 (undefined 또는 빈 값).');
+} else {
+  console.log(`✅ DISCORD_TOKEN 확인됨 (길이: ${tokenCheck.length}자)`);
+}
+
 client.login(process.env.DISCORD_TOKEN);
