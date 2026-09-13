@@ -21,6 +21,7 @@ const {
   StreamType,
 } = require('@discordjs/voice');
 const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
+const play = require('play-dl');
 
 // ===== 기본 음성 설정 (/목소리, /속도 명령어로 서버별로 바꿀 수 있습니다) =====
 const DEFAULT_VOICE = 'ko-KR-InJoonNeural'; // 남자 목소리. 여자 목소리는 'ko-KR-SunHiNeural'
@@ -95,6 +96,30 @@ const commands = [
   new SlashCommandBuilder()
     .setName('설정확인')
     .setDescription('현재 목소리/속도 설정을 확인합니다'),
+  new SlashCommandBuilder()
+    .setName('재생')
+    .setDescription('노래를 재생하거나 대기열에 추가합니다')
+    .addStringOption((option) =>
+      option
+        .setName('검색어')
+        .setDescription('노래 제목 또는 유튜브 링크')
+        .setRequired(true),
+    ),
+  new SlashCommandBuilder()
+    .setName('스킵')
+    .setDescription('지금 재생 중인 노래를 건너뜁니다'),
+  new SlashCommandBuilder()
+    .setName('정지')
+    .setDescription('재생을 멈추고 대기열을 비웁니다'),
+  new SlashCommandBuilder()
+    .setName('일시정지')
+    .setDescription('재생을 일시정지합니다'),
+  new SlashCommandBuilder()
+    .setName('재개')
+    .setDescription('일시정지된 재생을 다시 시작합니다'),
+  new SlashCommandBuilder()
+    .setName('대기열')
+    .setDescription('현재 대기열을 보여줍니다'),
 ].map((command) => command.toJSON());
 
 async function registerCommandsForGuild(guildId) {
@@ -133,19 +158,20 @@ function scheduleLeave(guildId) {
 }
 
 // 길드(서버)별로 오디오 플레이어와 대기열을 관리합니다.
-// { player, queue: string[], playing: boolean }
+// queue의 각 항목: { type: 'tts', text } 또는 { type: 'music', title, url }
 const guildAudio = new Map();
 
 function getGuildAudio(guildId) {
   if (!guildAudio.has(guildId)) {
     const player = createAudioPlayer();
-    const state = { player, queue: [], playing: false };
+    const state = { player, queue: [], playing: false, nowPlaying: null };
     guildAudio.set(guildId, state);
 
-    // 재생이 끝나면 대기열의 다음 문장을 재생하고,
+    // 재생이 끝나면 대기열의 다음 항목을 재생하고,
     // 더 이상 재생할 게 없으면 잠시 후 채널을 나갑니다.
     player.on(AudioPlayerStatus.Idle, () => {
       state.playing = false;
+      state.nowPlaying = null;
       if (state.queue.length > 0) {
         playNext(guildId);
       } else {
@@ -156,6 +182,7 @@ function getGuildAudio(guildId) {
     player.on('error', (error) => {
       console.error(`[오디오 재생 오류] 길드 ${guildId}:`, error.message);
       state.playing = false;
+      state.nowPlaying = null;
       if (state.queue.length > 0) {
         playNext(guildId);
       } else {
@@ -170,28 +197,37 @@ async function playNext(guildId) {
   const state = guildAudio.get(guildId);
   if (!state || state.playing || state.queue.length === 0) return;
 
-  const text = state.queue.shift();
+  const item = state.queue.shift();
   state.playing = true;
-  const settings = getSettings(guildId);
 
   try {
-    const tts = new MsEdgeTTS();
-    await tts.setMetadata(settings.voice, OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
-    const { audioStream } = tts.toStream(text, { rate: rateToString(settings.rate) });
-
-    const resource = createAudioResource(audioStream, { inputType: StreamType.WebmOpus });
-    state.player.play(resource);
+    if (item.type === 'tts') {
+      const settings = getSettings(guildId);
+      const tts = new MsEdgeTTS();
+      await tts.setMetadata(settings.voice, OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
+      const { audioStream } = tts.toStream(item.text, { rate: rateToString(settings.rate) });
+      const resource = createAudioResource(audioStream, { inputType: StreamType.WebmOpus });
+      state.nowPlaying = null;
+      state.player.play(resource);
+    } else if (item.type === 'music') {
+      const streamInfo = await play.stream(item.url);
+      const resource = createAudioResource(streamInfo.stream, { inputType: streamInfo.type });
+      state.nowPlaying = item;
+      state.player.play(resource);
+    }
   } catch (error) {
-    console.error('TTS 생성 오류:', error.message);
+    console.error('재생 오류:', error.message);
     state.playing = false;
+    state.nowPlaying = null;
     playNext(guildId);
   }
 }
 
-async function speak(voiceChannel, text) {
+// voiceChannel: 접속할 음성채널, item: 큐에 넣을 항목({type, ...})
+async function enqueue(voiceChannel, item) {
   const guildId = voiceChannel.guild.id;
 
-  // 나가려고 예약해둔 게 있다면 취소합니다 (새로 알릴 게 생겼으므로).
+  // 나가려고 예약해둔 게 있다면 취소합니다 (새로 재생할 게 생겼으므로).
   cancelScheduledLeave(guildId);
 
   let connection = getVoiceConnection(guildId);
@@ -208,7 +244,7 @@ async function speak(voiceChannel, text) {
     } catch (error) {
       console.error('음성 채널 연결 실패:', error.message);
       connection.destroy();
-      return;
+      return false;
     }
 
     connection.on(VoiceConnectionStatus.Disconnected, () => {
@@ -218,8 +254,13 @@ async function speak(voiceChannel, text) {
 
   const state = getGuildAudio(guildId);
   connection.subscribe(state.player);
-  state.queue.push(text);
+  state.queue.push(item);
   playNext(guildId);
+  return true;
+}
+
+async function speak(voiceChannel, text) {
+  await enqueue(voiceChannel, { type: 'tts', text });
 }
 
 client.once(Events.ClientReady, async (c) => {
@@ -241,35 +282,150 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand() || !interaction.inGuild()) return;
 
   const member = interaction.member;
-  if (!member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+  const guildId = interaction.guildId;
+
+  // ===== 설정 명령어 (서버 관리 권한 필요) =====
+  if (interaction.commandName === '목소리' || interaction.commandName === '속도') {
+    if (!member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+      await interaction.reply({
+        content: '이 명령어는 "서버 관리" 권한이 있는 사람만 사용할 수 있어요.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const settings = getSettings(guildId);
+
+    if (interaction.commandName === '목소리') {
+      const choice = interaction.options.getString('설정');
+      settings.voice = choice === 'male' ? DEFAULT_VOICE : 'ko-KR-SunHiNeural';
+      await interaction.reply({
+        content: `목소리를 ${voiceLabel(settings.voice)}로 설정했어요.`,
+        ephemeral: true,
+      });
+    } else {
+      const percent = interaction.options.getInteger('퍼센트');
+      settings.rate = percent;
+      await interaction.reply({
+        content: `말하기 속도를 ${rateToString(percent)}로 설정했어요.`,
+        ephemeral: true,
+      });
+    }
+    return;
+  }
+
+  if (interaction.commandName === '설정확인') {
+    const settings = getSettings(guildId);
     await interaction.reply({
-      content: '이 명령어는 "서버 관리" 권한이 있는 사람만 사용할 수 있어요.',
+      content: `현재 목소리: ${voiceLabel(settings.voice)}\n현재 속도: ${rateToString(settings.rate)}`,
       ephemeral: true,
     });
     return;
   }
 
-  const settings = getSettings(interaction.guildId);
+  // ===== 음악 명령어 (누구나 사용 가능) =====
+  if (interaction.commandName === '재생') {
+    const voiceChannel = member.voice.channel;
+    if (!voiceChannel) {
+      await interaction.reply({ content: '먼저 음성채널에 들어가 있어야 해요.', ephemeral: true });
+      return;
+    }
 
-  if (interaction.commandName === '목소리') {
-    const choice = interaction.options.getString('설정');
-    settings.voice = choice === 'male' ? DEFAULT_VOICE : 'ko-KR-SunHiNeural';
-    await interaction.reply({
-      content: `목소리를 ${voiceLabel(settings.voice)}로 설정했어요.`,
-      ephemeral: true,
+    await interaction.deferReply();
+
+    const query = interaction.options.getString('검색어');
+    try {
+      let url = query;
+      let title = query;
+
+      const validation = await play.validate(query);
+      if (validation !== 'yt_video') {
+        const results = await play.search(query, { limit: 1, source: { youtube: 'video' } });
+        if (!results.length) {
+          await interaction.editReply('검색 결과를 찾을 수 없어요.');
+          return;
+        }
+        url = results[0].url;
+        title = results[0].title;
+      } else {
+        const info = await play.video_info(query);
+        title = info.video_details.title;
+      }
+
+      const state = getGuildAudio(guildId);
+      const wasIdle = state.queue.length === 0 && !state.playing;
+      await enqueue(voiceChannel, { type: 'music', title, url });
+
+      await interaction.editReply(
+        wasIdle ? `🎵 지금 재생: **${title}**` : `➕ 대기열에 추가됨: **${title}**`,
+      );
+    } catch (error) {
+      console.error('재생 명령어 오류:', error.message);
+      await interaction.editReply('노래를 재생하는 중 오류가 발생했어요. 다른 검색어나 링크로 시도해보세요.');
+    }
+    return;
+  }
+
+  if (interaction.commandName === '스킵') {
+    const state = guildAudio.get(guildId);
+    if (!state || !state.playing) {
+      await interaction.reply({ content: '지금 재생 중인 게 없어요.', ephemeral: true });
+      return;
+    }
+    state.player.stop(); // Idle 이벤트가 발생해서 자동으로 다음 곡으로 넘어갑니다.
+    await interaction.reply('⏭️ 다음 곡으로 넘어갈게요.');
+    return;
+  }
+
+  if (interaction.commandName === '정지') {
+    const state = guildAudio.get(guildId);
+    if (state) {
+      state.queue = [];
+      state.player.stop();
+    }
+    const connection = getVoiceConnection(guildId);
+    if (connection) connection.destroy();
+    await interaction.reply('⏹️ 재생을 멈추고 채널에서 나갔어요.');
+    return;
+  }
+
+  if (interaction.commandName === '일시정지') {
+    const state = guildAudio.get(guildId);
+    if (!state || !state.playing) {
+      await interaction.reply({ content: '지금 재생 중인 게 없어요.', ephemeral: true });
+      return;
+    }
+    state.player.pause();
+    await interaction.reply('⏸️ 일시정지했어요.');
+    return;
+  }
+
+  if (interaction.commandName === '재개') {
+    const state = guildAudio.get(guildId);
+    if (!state) {
+      await interaction.reply({ content: '지금 재생 중인 게 없어요.', ephemeral: true });
+      return;
+    }
+    state.player.unpause();
+    await interaction.reply('▶️ 다시 재생할게요.');
+    return;
+  }
+
+  if (interaction.commandName === '대기열') {
+    const state = guildAudio.get(guildId);
+    if (!state || (!state.nowPlaying && state.queue.length === 0)) {
+      await interaction.reply({ content: '대기열이 비어있어요.', ephemeral: true });
+      return;
+    }
+    const lines = [];
+    if (state.nowPlaying) lines.push(`🎵 지금 재생 중: **${state.nowPlaying.title}**`);
+    const musicQueue = state.queue.filter((item) => item.type === 'music');
+    musicQueue.slice(0, 10).forEach((item, i) => {
+      lines.push(`${i + 1}. ${item.title}`);
     });
-  } else if (interaction.commandName === '속도') {
-    const percent = interaction.options.getInteger('퍼센트');
-    settings.rate = percent;
-    await interaction.reply({
-      content: `말하기 속도를 ${rateToString(percent)}로 설정했어요.`,
-      ephemeral: true,
-    });
-  } else if (interaction.commandName === '설정확인') {
-    await interaction.reply({
-      content: `현재 목소리: ${voiceLabel(settings.voice)}\n현재 속도: ${rateToString(settings.rate)}`,
-      ephemeral: true,
-    });
+    if (musicQueue.length > 10) lines.push(`...외 ${musicQueue.length - 10}곡`);
+    await interaction.reply({ content: lines.join('\n'), ephemeral: true });
+    return;
   }
 });
 
