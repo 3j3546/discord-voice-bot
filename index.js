@@ -1,6 +1,9 @@
 require('dotenv').config();
 
 const http = require('http');
+const https = require('https');
+const path = require('path');
+const { execFile } = require('child_process');
 const {
   Client,
   GatewayIntentBits,
@@ -21,7 +24,65 @@ const {
   StreamType,
 } = require('@discordjs/voice');
 const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
-const play = require('play-dl');
+
+const YTDLP_PATH = path.join(__dirname, 'bin', 'yt-dlp');
+
+// 검색어 또는 유튜브 링크를 넣으면 { title, url }을 반환합니다.
+// url은 실제 오디오(webm/opus) 파일을 가리키는 다이렉트 링크입니다.
+function getAudioInfo(query) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      YTDLP_PATH,
+      [
+        '--no-warnings',
+        '--no-playlist',
+        '--dump-single-json',
+        '--format',
+        'bestaudio[ext=webm]/bestaudio',
+        '--default-search',
+        'ytsearch1',
+        query,
+      ],
+      { maxBuffer: 1024 * 1024 * 20, timeout: 30_000 },
+      (error, stdout) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        try {
+          const info = JSON.parse(stdout);
+          resolve({ title: info.title, url: info.url });
+        } catch (parseError) {
+          reject(parseError);
+        }
+      },
+    );
+  });
+}
+
+// 다이렉트 오디오 URL을 읽을 수 있는 스트림으로 반환합니다 (리다이렉트 자동 처리).
+function fetchAudioStream(url, redirectCount = 0) {
+  return new Promise((resolve, reject) => {
+    if (redirectCount > 5) {
+      reject(new Error('리다이렉트가 너무 많습니다'));
+      return;
+    }
+    https
+      .get(url, (res) => {
+        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+          res.resume();
+          resolve(fetchAudioStream(res.headers.location, redirectCount + 1));
+          return;
+        }
+        if (res.statusCode !== 200) {
+          reject(new Error(`오디오 스트림 요청 실패 (HTTP ${res.statusCode})`));
+          return;
+        }
+        resolve(res);
+      })
+      .on('error', reject);
+  });
+}
 
 // ===== 기본 음성 설정 (/목소리, /속도 명령어로 서버별로 바꿀 수 있습니다) =====
 const DEFAULT_VOICE = 'ko-KR-InJoonNeural'; // 남자 목소리. 여자 목소리는 'ko-KR-SunHiNeural'
@@ -210,8 +271,8 @@ async function playNext(guildId) {
       state.nowPlaying = null;
       state.player.play(resource);
     } else if (item.type === 'music') {
-      const streamInfo = await play.stream(item.url);
-      const resource = createAudioResource(streamInfo.stream, { inputType: streamInfo.type });
+      const audioStream = await fetchAudioStream(item.url);
+      const resource = createAudioResource(audioStream, { inputType: StreamType.WebmOpus });
       state.nowPlaying = item;
       state.player.play(resource);
     }
@@ -335,22 +396,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     const query = interaction.options.getString('검색어');
     try {
-      let url = query;
-      let title = query;
-
-      const validation = await play.validate(query);
-      if (validation !== 'yt_video') {
-        const results = await play.search(query, { limit: 1, source: { youtube: 'video' } });
-        if (!results.length) {
-          await interaction.editReply('검색 결과를 찾을 수 없어요.');
-          return;
-        }
-        url = results[0].url;
-        title = results[0].title;
-      } else {
-        const info = await play.video_info(query);
-        title = info.video_details.title;
-      }
+      const { title, url } = await getAudioInfo(query);
 
       const state = getGuildAudio(guildId);
       const wasIdle = state.queue.length === 0 && !state.playing;
