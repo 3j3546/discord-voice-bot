@@ -70,10 +70,14 @@ function getAudioInfo(query) {
     execFile(
       YTDLP_PATH,
       args,
-      { maxBuffer: 1024 * 1024 * 20, timeout: 30_000 },
-      (error, stdout) => {
+      { maxBuffer: 1024 * 1024 * 20, timeout: 60_000 },
+      (error, stdout, stderr) => {
         if (error) {
-          reject(error);
+          const detail = (stderr && stderr.trim()) || error.message || '(자세한 원인 없음)';
+          const reason = error.killed
+            ? `시간 초과로 강제 종료됨 (signal: ${error.signal})`
+            : `종료 코드 ${error.code}`;
+          reject(new Error(`${reason} — ${detail}`));
           return;
         }
         try {
