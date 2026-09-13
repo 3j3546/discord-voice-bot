@@ -56,8 +56,6 @@ function getVideoTitle(query) {
       '--skip-download',
       '--print',
       '%(title)s',
-      '--extractor-args',
-      'youtube:player_client=android,web',
       '--default-search',
       'ytsearch1',
     ];
@@ -96,8 +94,6 @@ function createMusicStream(query) {
     '-',
     '--no-warnings',
     '--no-playlist',
-    '--extractor-args',
-    'youtube:player_client=android,web',
     '--default-search',
     'ytsearch1',
   ];
@@ -235,6 +231,12 @@ const commands = [
   new SlashCommandBuilder()
     .setName('대기열')
     .setDescription('현재 대기열을 보여줍니다'),
+  new SlashCommandBuilder()
+    .setName('디버그')
+    .setDescription('(임시) yt-dlp 포맷 목록을 직접 확인합니다')
+    .addStringOption((option) =>
+      option.setName('링크').setDescription('테스트할 유튜브 링크').setRequired(false),
+    ),
 ].map((command) => command.toJSON());
 
 async function registerCommandsForGuild(guildId) {
@@ -400,8 +402,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
   const member = interaction.member;
   const guildId = interaction.guildId;
 
-  // ===== 설정 명령어 (서버 관리 권한 필요) =====
-  if (interaction.commandName === '목소리' || interaction.commandName === '속도') {
+  // ===== 설정/디버그 명령어 (서버 관리 권한 필요) =====
+  if (
+    interaction.commandName === '목소리' ||
+    interaction.commandName === '속도' ||
+    interaction.commandName === '디버그'
+  ) {
     if (!member.permissions.has(PermissionFlagsBits.ManageGuild)) {
       await interaction.reply({
         content: '이 명령어는 "서버 관리" 권한이 있는 사람만 사용할 수 있어요.',
@@ -409,7 +415,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
       return;
     }
+  }
 
+  if (interaction.commandName === '목소리' || interaction.commandName === '속도') {
     const settings = getSettings(guildId);
 
     if (interaction.commandName === '목소리') {
@@ -526,6 +534,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
     });
     if (musicQueue.length > 10) lines.push(`...외 ${musicQueue.length - 10}곡`);
     await interaction.reply({ content: lines.join('\n'), ephemeral: true });
+    return;
+  }
+
+  if (interaction.commandName === '디버그') {
+    await interaction.deferReply({ ephemeral: true });
+    const testUrl = interaction.options.getString('링크') || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+    const cookiesPath = findCookiesFile();
+    const args = ['-F', testUrl];
+    if (cookiesPath) args.push('--cookies', cookiesPath);
+
+    execFile(YTDLP_PATH, args, { maxBuffer: 1024 * 1024 * 5, timeout: 30_000 }, (error, stdout, stderr) => {
+      const cookieStatus = cookiesPath ? `쿠키 파일 사용함: ${cookiesPath}` : '⚠️ 쿠키 파일을 못 찾음';
+      const output = error ? (stderr || error.message) : stdout;
+      const trimmed = output.length > 1700 ? output.slice(0, 1700) + '\n...(생략)' : output;
+      interaction.editReply(`${cookieStatus}\n\`\`\`\n${trimmed}\n\`\`\``);
+    });
     return;
   }
 });
