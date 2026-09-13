@@ -27,12 +27,23 @@ const {
 const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
 
 const YTDLP_PATH = path.join(__dirname, 'bin', 'yt-dlp');
+const WRITABLE_COOKIES_PATH = path.join(require('os').tmpdir(), 'ytdlp-cookies.txt');
 
-// 유튜브 로그인 쿠키 파일 경로. Render의 Secret Files 기능으로 올리면 /etc/secrets/cookies.txt에 위치합니다.
-// 로컬에서 테스트할 때는 프로젝트 폴더에 cookies.txt를 두면 자동으로 인식합니다.
+// 유튜브 로그인 쿠키 파일 경로를 찾습니다.
+// Render의 Secret Files는 읽기 전용(/etc/secrets/cookies.txt)이라 yt-dlp가 쿠키를
+// 갱신하려고 쓰기를 시도하면 오류가 나므로, 매번 쓰기 가능한 임시 경로로 복사해서 사용합니다.
 function findCookiesFile() {
   const candidates = ['/etc/secrets/cookies.txt', path.join(__dirname, 'cookies.txt')];
-  return candidates.find((p) => fs.existsSync(p)) || null;
+  const original = candidates.find((p) => fs.existsSync(p));
+  if (!original) return null;
+
+  try {
+    fs.copyFileSync(original, WRITABLE_COOKIES_PATH);
+    return WRITABLE_COOKIES_PATH;
+  } catch (error) {
+    console.error('쿠키 파일 복사 실패:', error.message);
+    return original; // 복사에 실패하면 원본 경로라도 시도합니다.
+  }
 }
 
 // 검색어 또는 유튜브 링크를 넣으면 { title, url }을 반환합니다.
