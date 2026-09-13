@@ -1,0 +1,18 @@
+{
+  "name": "discord-voice-announcer",
+  "version": "1.0.0",
+  "description": "음성채널 입장/퇴장을 TTS 음성으로 알려주는 디스코드 봇",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.19.2",
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.5",
+    "libsodium-wrappers": "^0.7.13",
+    "msedge-tts": "^2.0.7",
+    "opusscript": "^0.1.1"
+  }
+}
