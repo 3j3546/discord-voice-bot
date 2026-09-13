@@ -3,6 +3,7 @@ require('dotenv').config();
 const http = require('http');
 const https = require('https');
 const path = require('path');
+const fs = require('fs');
 const { execFile } = require('child_process');
 const {
   Client,
@@ -27,22 +28,37 @@ const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
 
 const YTDLP_PATH = path.join(__dirname, 'bin', 'yt-dlp');
 
+// 유튜브 로그인 쿠키 파일 경로. Render의 Secret Files 기능으로 올리면 /etc/secrets/cookies.txt에 위치합니다.
+// 로컬에서 테스트할 때는 프로젝트 폴더에 cookies.txt를 두면 자동으로 인식합니다.
+function findCookiesFile() {
+  const candidates = ['/etc/secrets/cookies.txt', path.join(__dirname, 'cookies.txt')];
+  return candidates.find((p) => fs.existsSync(p)) || null;
+}
+
 // 검색어 또는 유튜브 링크를 넣으면 { title, url }을 반환합니다.
 // url은 실제 오디오(webm/opus) 파일을 가리키는 다이렉트 링크입니다.
 function getAudioInfo(query) {
   return new Promise((resolve, reject) => {
+    const args = [
+      '--no-warnings',
+      '--no-playlist',
+      '--dump-single-json',
+      '--format',
+      'bestaudio[ext=webm]/bestaudio',
+      '--default-search',
+      'ytsearch1',
+    ];
+
+    const cookiesPath = findCookiesFile();
+    if (cookiesPath) {
+      args.push('--cookies', cookiesPath);
+    }
+
+    args.push(query);
+
     execFile(
       YTDLP_PATH,
-      [
-        '--no-warnings',
-        '--no-playlist',
-        '--dump-single-json',
-        '--format',
-        'bestaudio[ext=webm]/bestaudio',
-        '--default-search',
-        'ytsearch1',
-        query,
-      ],
+      args,
       { maxBuffer: 1024 * 1024 * 20, timeout: 30_000 },
       (error, stdout) => {
         if (error) {
