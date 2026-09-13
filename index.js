@@ -514,13 +514,13 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
 
   // 새로운 음성채널 입장
   if (!oldState.channelId && newState.channelId) {
-    speak(newState.channel, `${nickname}님이 입장했습니다`);
+    speak(newState.channel, `${nickname}님이 왜들어왔지?`);
     return;
   }
 
   // 음성채널에서 완전히 퇴장
   if (oldState.channelId && !newState.channelId) {
-    speak(oldState.channel, `${nickname}님이 퇴장했습니다`);
+    speak(oldState.channel, `${nickname}님이 나갔스빈다람쥐`);
     return;
   }
 
