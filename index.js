@@ -56,6 +56,10 @@ function getAudioInfo(query) {
       '--dump-single-json',
       '--format',
       'bestaudio[ext=webm]/bestaudio',
+      // 유튜브가 기본(web) 클라이언트에 대해 오디오 전용 스트림을 자주 숨기기 때문에,
+      // android 클라이언트로도 같이 시도해서 더 많은 포맷을 볼 수 있게 합니다.
+      '--extractor-args',
+      'youtube:player_client=android,web',
       '--default-search',
       'ytsearch1',
     ];
@@ -514,13 +518,13 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
 
   // 새로운 음성채널 입장
   if (!oldState.channelId && newState.channelId) {
-    speak(newState.channel, `${nickname}님이 왜들어왔지?`);
+    speak(newState.channel, `${nickname} 아 왜들어왔니?`);
     return;
   }
 
   // 음성채널에서 완전히 퇴장
   if (oldState.channelId && !newState.channelId) {
-    speak(oldState.channel, `${nickname}님이 나갔스빈다람쥐`);
+    speak(oldState.channel, `${nickname}아 왜나갔니?`);
     return;
   }
 
