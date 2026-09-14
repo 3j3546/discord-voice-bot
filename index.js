@@ -242,6 +242,9 @@ const commands = [
     .setDescription('(임시) yt-dlp 포맷 목록을 직접 확인합니다')
     .addStringOption((option) =>
       option.setName('링크').setDescription('테스트할 유튜브 링크').setRequired(false),
+    )
+    .addBooleanOption((option) =>
+      option.setName('쿠키사용').setDescription('쿠키 파일을 사용할지 (기본값: 사용함)').setRequired(false),
     ),
 ].map((command) => command.toJSON());
 
@@ -546,12 +549,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.commandName === '디버그') {
     await interaction.deferReply({ ephemeral: true });
     const testUrl = interaction.options.getString('링크') || 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
-    const cookiesPath = findCookiesFile();
+    const useCookies = interaction.options.getBoolean('쿠키사용') ?? true;
+    const cookiesPath = useCookies ? findCookiesFile() : null;
     const args = ['-F', ...JS_RUNTIME_ARGS, testUrl];
     if (cookiesPath) args.push('--cookies', cookiesPath);
 
     execFile(YTDLP_PATH, args, { maxBuffer: 1024 * 1024 * 5, timeout: 30_000 }, (error, stdout, stderr) => {
-      const cookieStatus = cookiesPath ? `쿠키 파일 사용함: ${cookiesPath}` : '⚠️ 쿠키 파일을 못 찾음';
+      const cookieStatus = !useCookies
+        ? '쿠키 사용 안 함 (테스트)'
+        : cookiesPath
+          ? `쿠키 파일 사용함: ${cookiesPath}`
+          : '⚠️ 쿠키 파일을 못 찾음';
       const output = error ? (stderr || error.message) : stdout;
       const trimmed = output.length > 1700 ? output.slice(0, 1700) + '\n...(생략)' : output;
       interaction.editReply(`${cookieStatus}\n\`\`\`\n${trimmed}\n\`\`\``);
