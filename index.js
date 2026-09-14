@@ -1,5 +1,14 @@
 require('dotenv').config();
 
+// 라바링크 같은 외부 라이브러리에서 예기치 못한 오류가 나도
+// 봇 전체(입퇴장 안내 포함)가 죽지 않도록 안전장치를 겁니다.
+process.on('uncaughtException', (error) => {
+  console.error('⚠️ 처리되지 않은 예외 발생 (봇은 계속 실행됩니다):', error.message);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️ 처리되지 않은 Promise 거부 발생 (봇은 계속 실행됩니다):', reason);
+});
+
 const http = require('http');
 const {
   Client,
@@ -38,13 +47,6 @@ const LAVALINK_NODES = [
     port: Number(process.env.LAVALINK_PORT) || 443,
     authorization: process.env.LAVALINK_PASSWORD || 'https://dsc.gg/ajidevserver',
     secure: process.env.LAVALINK_SECURE ? process.env.LAVALINK_SECURE === 'true' : true,
-  },
-  {
-    id: 'backup',
-    host: 'sg.lavalink.heavencloud.in',
-    port: 443,
-    authorization: 'heavencloud',
-    secure: true,
   },
 ];
 // ======================================================================
@@ -291,7 +293,11 @@ client.once(Events.ClientReady, async (c) => {
     console.error(`⚠️ Lavalink 노드 연결 오류 (${node.id}):`, error.message);
   });
 
-  await client.lavalink.init({ id: c.user.id, username: c.user.username });
+  try {
+    await client.lavalink.init({ id: c.user.id, username: c.user.username });
+  } catch (error) {
+    console.error('⚠️ Lavalink 초기화 실패 (음악 기능만 안 될 수 있음):', error.message);
+  }
 
   // 봇이 들어가 있는 모든 서버에 슬래시 명령어를 등록합니다.
   for (const guild of c.guilds.cache.values()) {
