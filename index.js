@@ -392,8 +392,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const query = interaction.options.getString('검색어');
       const result = await player.search({ query, source: 'ytsearch' }, interaction.user);
 
+      console.log('검색 결과 디버그:', JSON.stringify({
+        loadType: result && result.loadType,
+        trackCount: result && result.tracks ? result.tracks.length : null,
+        exception: result && result.exception,
+      }));
+
       if (!result || !result.tracks.length) {
-        await interaction.editReply('검색 결과를 찾을 수 없어요.');
+        await interaction.editReply(
+          `검색 결과를 찾을 수 없어요. (loadType: ${result ? result.loadType : '없음'}${
+            result && result.exception ? `, 이유: ${result.exception.message}` : ''
+          })`,
+        );
         return;
       }
 
