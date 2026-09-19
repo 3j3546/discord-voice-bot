@@ -109,7 +109,63 @@ function getAcceptableStartChars(lastChar) {
   return [...accepted];
 }
 
-function checkWordChain(game, word) {
+// ===== 한국어 위키낱말사전(Wiktionary) 연동 — API 키/가입 불필요 =====
+const dictWordCache = new Map(); // 단어 -> 실존 여부(boolean)
+const dictDeadEndCache = new Map(); // 글자 -> 한방단어(다음 이을 말이 없음) 여부(boolean)
+
+async function fetchWiktionary(params) {
+  const url = `https://ko.wiktionary.org/w/api.php?format=json&${params}`;
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`사전 API 응답 오류 (HTTP ${response.status})`);
+  return response.json();
+}
+
+// 실제로 존재하는 단어인지 확인합니다 (위키낱말사전에 등재된 표제어인지).
+async function isRealWord(word) {
+  if (dictWordCache.has(word)) return dictWordCache.get(word);
+
+  try {
+    const data = await fetchWiktionary(`action=query&titles=${encodeURIComponent(word)}`);
+    const pages = (data && data.query && data.query.pages) || {};
+    const page = Object.values(pages)[0];
+    const exists = !!(page && !('missing' in page));
+    dictWordCache.set(word, exists);
+    return exists;
+  } catch (error) {
+    console.error('사전 조회 오류:', error.message);
+    return true; // API 오류 시에는 막지 않고 통과시킵니다.
+  }
+}
+
+// 이 글자로 시작하는 다른 단어가 사전에 있는지 확인합니다 (없으면 한방단어).
+async function hasFollowingWord(char, wordToExclude) {
+  if (dictDeadEndCache.has(char)) return !dictDeadEndCache.get(char);
+
+  try {
+    const data = await fetchWiktionary(
+      `action=query&list=allpages&apprefix=${encodeURIComponent(char)}&aplimit=50`,
+    );
+    const pages = (data && data.query && data.query.allpages) || [];
+    const hasOther = pages.some(
+      (page) => page.title.length >= 2 && page.title !== wordToExclude && /^[가-힣]+$/.test(page.title),
+    );
+    dictDeadEndCache.set(char, !hasOther);
+    return hasOther;
+  } catch (error) {
+    console.error('사전 조회 오류:', error.message);
+    return true;
+  }
+}
+
+// word가 한방단어(다음 사람이 이을 수 없는 단어)인지 확인합니다.
+async function isFinishingWord(word) {
+  const lastChar = word[word.length - 1];
+  const hasFollowing = await hasFollowingWord(lastChar, word);
+  return !hasFollowing;
+}
+
+// 반환값: null이면 통과, 문자열이면 실패 사유, { win: true }면 한방단어로 즉시 승리
+async function checkWordChain(game, word) {
   if (word.length < 2) return '두 글자 이상이어야 해요.';
   if (!/^[가-힣]+$/.test(word)) return '한글 단어만 가능해요.';
   if (game.usedWords.has(word)) return '이미 나온 단어예요.';
@@ -122,6 +178,19 @@ function checkWordChain(game, word) {
       return `**${lastChar}**(으)로 시작하는 단어를 입력해주세요.`;
     }
   }
+
+  const realWord = await isRealWord(word);
+  if (!realWord) return '사전에 없는 단어예요.';
+
+  const finishingWord = await isFinishingWord(word);
+  if (finishingWord) {
+    if (!game.lastWord) {
+      // 첫 단어로는 한방단어를 낼 수 없습니다.
+      return '한방단어는 첫 단어로 낼 수 없어요. 다른 단어로 시작해주세요.';
+    }
+    return { win: true };
+  }
+
   return null; // 통과
 }
 
@@ -517,9 +586,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.reply({ content: '이미 이 채널에서 끝말잇기가 진행 중이에요.', ephemeral: true });
       return;
     }
-    wordChainGames.set(interaction.channelId, { active: true, lastWord: null, usedWords: new Set() });
+    wordChainGames.set(interaction.channelId, {
+      active: true,
+      lastWord: null,
+      usedWords: new Set(),
+      lastAuthorId: null,
+      secondLastAuthorId: null,
+    });
     await interaction.reply(
-      '🔤 끝말잇기를 시작합니다! 아무 단어나 채팅에 입력해서 시작하세요 (두 글자 이상, 한글만).',
+      '🔤 끝말잇기를 시작합니다! 아무 단어나 채팅에 입력해서 시작하세요 (두 글자 이상, 한글만, 한방단어 불가).',
     );
     return;
   }
@@ -531,32 +606,55 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
     wordChainGames.delete(interaction.channelId);
-    await interaction.reply(
-      `🔤 끝말잇기를 종료합니다. 총 ${game.usedWords.size}개의 단어가 나왔어요!`,
-    );
+
+    if (game.lastAuthorId && game.secondLastAuthorId) {
+      await interaction.reply(
+        `🔤 끝말잇기를 종료합니다. (총 ${game.usedWords.size}개 단어)\n<@${game.lastAuthorId}>님 승리 🏆 <@${game.secondLastAuthorId}>님 패배`,
+      );
+    } else {
+      await interaction.reply(
+        `🔤 끝말잇기를 종료합니다. 총 ${game.usedWords.size}개의 단어가 나왔어요!`,
+      );
+    }
     return;
   }
 });
 
 // 끝말잇기 진행 중인 채널의 일반 채팅 메시지를 감시합니다.
-client.on(Events.MessageCreate, (message) => {
+client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
 
   const game = wordChainGames.get(message.channelId);
   if (!game || !game.active) return;
 
   const word = message.content.trim();
-  const errorReason = checkWordChain(game, word);
+  const result = await checkWordChain(game, word);
 
-  if (errorReason) {
-    message.react('❌').catch(() => {});
-    message.reply({ content: errorReason, allowedMentions: { repliedUser: false } }).catch(() => {});
+  if (result === null) {
+    game.usedWords.add(word);
+    game.lastWord = word;
+    game.secondLastAuthorId = game.lastAuthorId;
+    game.lastAuthorId = message.author.id;
+    message.react('✅').catch(() => {});
     return;
   }
 
-  game.usedWords.add(word);
-  game.lastWord = word;
-  message.react('✅').catch(() => {});
+  if (typeof result === 'object' && result.win) {
+    // 한방단어! 낸 사람이 승리, 직전에 단어를 낸 사람이 패배.
+    wordChainGames.delete(message.channelId);
+    message.react('🏆').catch(() => {});
+    message
+      .reply({
+        content: `**${word}**는 한방단어예요!\n<@${message.author.id}>님 승리 🏆 <@${game.lastAuthorId}>님 패배`,
+        allowedMentions: { repliedUser: false },
+      })
+      .catch(() => {});
+    return;
+  }
+
+  // 실패 사유 문자열
+  message.react('❌').catch(() => {});
+  message.reply({ content: result, allowedMentions: { repliedUser: false } }).catch(() => {});
 });
 
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
