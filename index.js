@@ -61,6 +61,9 @@ const client = new Client({
 // 주의: 메모리에만 저장되므로 봇이 재시작되면 기본값으로 초기화됩니다.
 const guildSettings = new Map();
 
+// 채널별로 가장 최근에 만든 투표 메시지 ID를 기억합니다 (/투표종료에서 사용).
+const activePolls = new Map();
+
 function getSettings(guildId) {
   if (!guildSettings.has(guildId)) {
     guildSettings.set(guildId, { voice: DEFAULT_VOICE, rate: DEFAULT_RATE });
@@ -74,6 +77,25 @@ function rateToString(rate) {
 
 function voiceLabel(voice) {
   return voice === DEFAULT_VOICE ? '남자 (인준)' : '여자 (선희)';
+}
+
+// 한국어가 섞인 프롬프트를 영어로 번역합니다 (이미지 생성 모델이 영어를 훨씬 잘 이해하기 때문).
+// 무료 번역 API(MyMemory)를 사용하며, 실패하면 원문을 그대로 반환합니다.
+async function translateToEnglishIfKorean(text) {
+  const hasKorean = /[\u3131-\uD79D]/.test(text);
+  if (!hasKorean) return text;
+
+  try {
+    const response = await fetch(
+      `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=ko|en`,
+    );
+    const data = await response.json();
+    const translated = data && data.responseData && data.responseData.translatedText;
+    return translated || text;
+  } catch (error) {
+    console.error('번역 실패:', error.message);
+    return text;
+  }
 }
 
 // ===== 슬래시 명령어 정의 =====
@@ -135,6 +157,9 @@ const commands = [
     .addStringOption((option) =>
       option.setName('항목5').setDescription('다섯 번째 선택지').setRequired(false),
     ),
+  new SlashCommandBuilder()
+    .setName('투표종료')
+    .setDescription('이 채널의 가장 최근 투표를 마감하고 결과를 보여줍니다'),
 ].map((command) => command.toJSON());
 
 async function registerCommandsForGuild(guildId) {
@@ -319,16 +344,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.commandName === '이미지') {
     await interaction.deferReply();
 
-    const prompt = interaction.options.getString('프롬프트');
+    const originalPrompt = interaction.options.getString('프롬프트');
+    const prompt = await translateToEnglishIfKorean(originalPrompt);
     const seed = Math.floor(Math.random() * 1_000_000); // 같은 프롬프트라도 매번 다른 이미지가 나오도록
     const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&seed=${seed}&nologo=true`;
 
     try {
       const embed = new EmbedBuilder()
-        .setTitle(prompt.length > 256 ? prompt.slice(0, 253) + '...' : prompt)
+        .setTitle(originalPrompt.length > 256 ? originalPrompt.slice(0, 253) + '...' : originalPrompt)
         .setImage(imageUrl)
         .setColor(0x5865f2)
-        .setFooter({ text: 'Pollinations.ai로 생성됨' });
+        .setFooter({
+          text:
+            prompt !== originalPrompt
+              ? `Pollinations.ai로 생성됨 · 번역: ${prompt}`
+              : 'Pollinations.ai로 생성됨',
+        });
 
       await interaction.editReply({ embeds: [embed] });
     } catch (error) {
@@ -350,10 +381,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       .setTitle(`📊 ${question}`)
       .setDescription(choices.map((choice, i) => `${NUMBER_EMOJIS[i]} ${choice}`).join('\n'))
       .setColor(0x57f287)
-      .setFooter({ text: `${interaction.user.displayName ?? interaction.user.username}님이 만든 투표` });
+      .setFooter({ text: `${interaction.user.displayName ?? interaction.user.username}님이 만든 투표 · /투표종료로 마감할 수 있어요` });
 
     await interaction.reply({ embeds: [embed] });
     const message = await interaction.fetchReply();
+    activePolls.set(interaction.channelId, { messageId: message.id, question, choices });
 
     for (let i = 0; i < choices.length; i++) {
       try {
@@ -361,6 +393,45 @@ client.on(Events.InteractionCreate, async (interaction) => {
       } catch (error) {
         console.error('투표 반응 추가 오류:', error.message);
       }
+    }
+    return;
+  }
+
+  if (interaction.commandName === '투표종료') {
+    const poll = activePolls.get(interaction.channelId);
+    if (!poll) {
+      await interaction.reply({ content: '이 채널에 마감할 투표가 없어요.', ephemeral: true });
+      return;
+    }
+
+    await interaction.deferReply();
+
+    try {
+      const NUMBER_EMOJIS = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
+      const message = await interaction.channel.messages.fetch(poll.messageId);
+
+      const results = [];
+      for (let i = 0; i < poll.choices.length; i++) {
+        const reaction = message.reactions.cache.get(NUMBER_EMOJIS[i]);
+        const count = reaction ? Math.max(0, reaction.count - 1) : 0; // 봇 자신의 반응 1개는 제외
+        results.push({ choice: poll.choices[i], count });
+      }
+
+      const maxCount = Math.max(...results.map((r) => r.count));
+      const lines = results
+        .sort((a, b) => b.count - a.count)
+        .map((r) => `${r.count === maxCount && maxCount > 0 ? '🏆 ' : ''}${r.choice}: **${r.count}표**`);
+
+      const resultEmbed = new EmbedBuilder()
+        .setTitle(`📊 [마감] ${poll.question}`)
+        .setDescription(lines.join('\n'))
+        .setColor(0xed4245);
+
+      await interaction.editReply({ embeds: [resultEmbed] });
+      activePolls.delete(interaction.channelId);
+    } catch (error) {
+      console.error('투표 마감 오류:', error.message);
+      await interaction.editReply('투표 결과를 집계하는 중 오류가 발생했어요.');
     }
     return;
   }
