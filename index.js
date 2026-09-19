@@ -1,6 +1,6 @@
 require('dotenv').config();
 
-// 라바링크 같은 외부 라이브러리에서 예기치 못한 오류가 나도
+// 외부 라이브러리에서 예기치 못한 오류가 나도
 // 봇 전체(입퇴장 안내 포함)가 죽지 않도록 안전장치를 겁니다.
 process.on('uncaughtException', (error) => {
   console.error('⚠️ 처리되지 않은 예외 발생 (봇은 계속 실행됩니다):', error.message);
@@ -31,25 +31,10 @@ const {
   StreamType,
 } = require('@discordjs/voice');
 const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
-const { LavalinkManager } = require('lavalink-client');
 
 // ===== 기본 음성 설정 (/목소리, /속도 명령어로 서버별로 바꿀 수 있습니다) =====
 const DEFAULT_VOICE = 'ko-KR-InJoonNeural'; // 남자 목소리. 여자 목소리는 'ko-KR-SunHiNeural'
 const DEFAULT_RATE = 25; // 기본 속도(%). 0이 보통 속도, 25면 25% 빠르게
-// ======================================================================
-
-// ===== 노래 재생용 Lavalink 노드 =====
-// 환경변수로 직접 지정하지 않으면 공개 무료 노드를 기본값으로 사용합니다.
-// 공개 노드는 언제든 죽을 수 있어서, 안 되면 다른 노드로 바꿔야 할 수 있습니다 (README 참고).
-const LAVALINK_NODES = [
-  {
-    id: 'main',
-    host: process.env.LAVALINK_HOST || 'lava-v4.ajieblogs.eu.org',
-    port: Number(process.env.LAVALINK_PORT) || 443,
-    authorization: process.env.LAVALINK_PASSWORD || 'https://dsc.gg/ajidevserver',
-    secure: process.env.LAVALINK_SECURE ? process.env.LAVALINK_SECURE === 'true' : true,
-  },
-];
 // ======================================================================
 
 // Render 같은 무료 웹 호스팅은 일정 시간 요청이 없으면 서버를 재웁니다.
@@ -121,30 +106,6 @@ const commands = [
     .setName('설정확인')
     .setDescription('현재 목소리/속도 설정을 확인합니다'),
   new SlashCommandBuilder()
-    .setName('재생')
-    .setDescription('노래를 재생하거나 대기열에 추가합니다')
-    .addStringOption((option) =>
-      option
-        .setName('검색어')
-        .setDescription('노래 제목 또는 유튜브 링크')
-        .setRequired(true),
-    ),
-  new SlashCommandBuilder()
-    .setName('스킵')
-    .setDescription('지금 재생 중인 노래를 건너뜁니다'),
-  new SlashCommandBuilder()
-    .setName('정지')
-    .setDescription('재생을 멈추고 대기열을 비웁니다'),
-  new SlashCommandBuilder()
-    .setName('일시정지')
-    .setDescription('재생을 일시정지합니다'),
-  new SlashCommandBuilder()
-    .setName('재개')
-    .setDescription('일시정지된 재생을 다시 시작합니다'),
-  new SlashCommandBuilder()
-    .setName('대기열')
-    .setDescription('현재 대기열을 보여줍니다'),
-  new SlashCommandBuilder()
     .setName('이미지')
     .setDescription('AI로 이미지를 생성합니다')
     .addStringOption((option) =>
@@ -152,6 +113,27 @@ const commands = [
         .setName('프롬프트')
         .setDescription('원하는 이미지에 대한 설명 (영어로 쓰면 더 잘 나와요)')
         .setRequired(true),
+    ),
+  new SlashCommandBuilder()
+    .setName('투표')
+    .setDescription('투표를 만듭니다 (반응으로 투표)')
+    .addStringOption((option) =>
+      option.setName('질문').setDescription('투표 주제').setRequired(true),
+    )
+    .addStringOption((option) =>
+      option.setName('항목1').setDescription('첫 번째 선택지').setRequired(true),
+    )
+    .addStringOption((option) =>
+      option.setName('항목2').setDescription('두 번째 선택지').setRequired(true),
+    )
+    .addStringOption((option) =>
+      option.setName('항목3').setDescription('세 번째 선택지').setRequired(false),
+    )
+    .addStringOption((option) =>
+      option.setName('항목4').setDescription('네 번째 선택지').setRequired(false),
+    )
+    .addStringOption((option) =>
+      option.setName('항목5').setDescription('다섯 번째 선택지').setRequired(false),
     ),
 ].map((command) => command.toJSON());
 
@@ -191,7 +173,6 @@ function scheduleLeave(guildId) {
 }
 
 // ===== 입퇴장 안내(TTS) 재생 큐 =====
-// 노래 재생은 Lavalink가 완전히 별도로 처리하므로, 여기는 TTS 안내만 다룹니다.
 const guildAudio = new Map();
 
 function getGuildAudio(guildId) {
@@ -246,12 +227,6 @@ async function playNext(guildId) {
 async function speak(voiceChannel, text) {
   const guildId = voiceChannel.guild.id;
 
-  // 노래가 재생 중이면 음성 연결이 충돌하지 않도록 안내를 건너뜁니다.
-  const musicPlayer = client.lavalink && client.lavalink.getPlayer(guildId);
-  if (musicPlayer && (musicPlayer.playing || musicPlayer.paused)) {
-    return;
-  }
-
   cancelScheduledLeave(guildId);
 
   let connection = getVoiceConnection(guildId);
@@ -285,43 +260,12 @@ async function speak(voiceChannel, text) {
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ 로그인 완료: ${c.user.tag}`);
 
-  // ===== Lavalink 초기화 (노래 재생 담당) =====
-  client.lavalink = new LavalinkManager({
-    nodes: LAVALINK_NODES,
-    sendToShard: (guildId, payload) => {
-      const guild = client.guilds.cache.get(guildId);
-      if (guild) guild.shard.send(payload);
-    },
-    autoSkip: true,
-    client: { id: c.user.id, username: c.user.username },
-  });
-
-  client.lavalink.nodeManager.on('connect', (node) => {
-    console.log(`✅ Lavalink 노드 연결됨: ${node.id}`);
-  });
-  client.lavalink.nodeManager.on('error', (node, error) => {
-    console.error(`⚠️ Lavalink 노드 연결 오류 (${node.id}):`, error.message);
-  });
-
-  try {
-    await client.lavalink.init({ id: c.user.id, username: c.user.username });
-  } catch (error) {
-    console.error('⚠️ Lavalink 초기화 실패 (음악 기능만 안 될 수 있음):', error.message);
-  }
-
-  // 봇이 들어가 있는 모든 서버에 슬래시 명령어를 등록합니다.
   for (const guild of c.guilds.cache.values()) {
     await registerCommandsForGuild(guild.id);
   }
   console.log('✅ 슬래시 명령어 등록 완료');
 });
 
-// Lavalink가 음성 서버 정보를 받을 수 있도록 원본 게이트웨이 이벤트를 전달합니다.
-client.on('raw', (data) => {
-  if (client.lavalink) client.lavalink.sendRawData(data);
-});
-
-// 봇이 새로운 서버에 초대되면 그 서버에도 명령어를 등록합니다.
 client.on(Events.GuildCreate, (guild) => {
   registerCommandsForGuild(guild.id);
 });
@@ -371,131 +315,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  // ===== 음악 명령어 (누구나 사용 가능, Lavalink로 처리) =====
-  if (interaction.commandName === '재생') {
-    const voiceChannel = member.voice.channel;
-    if (!voiceChannel) {
-      await interaction.reply({ content: '먼저 음성채널에 들어가 있어야 해요.', ephemeral: true });
-      return;
-    }
-    if (!client.lavalink) {
-      await interaction.reply({ content: '음악 시스템이 아직 준비 중이에요. 잠시 후 다시 시도해주세요.', ephemeral: true });
-      return;
-    }
-
-    await interaction.deferReply();
-
-    try {
-      let player = client.lavalink.getPlayer(guildId);
-      if (!player) {
-        player = client.lavalink.createPlayer({
-          guildId,
-          voiceChannelId: voiceChannel.id,
-          textChannelId: interaction.channelId,
-          selfDeaf: true,
-        });
-      }
-      if (!player.connected) {
-        await player.connect();
-      }
-
-      const query = interaction.options.getString('검색어');
-      const result = await player.search({ query, source: 'ytsearch' }, interaction.user);
-
-      console.log('검색 결과 디버그:', JSON.stringify({
-        loadType: result && result.loadType,
-        trackCount: result && result.tracks ? result.tracks.length : null,
-        exception: result && result.exception,
-      }));
-
-      if (!result || !result.tracks.length) {
-        await interaction.editReply(
-          `검색 결과를 찾을 수 없어요. (loadType: ${result ? result.loadType : '없음'}${
-            result && result.exception ? `, 이유: ${result.exception.message}` : ''
-          })`,
-        );
-        return;
-      }
-
-      const wasIdle = !player.playing && !player.paused && player.queue.tracks.length === 0;
-
-      if (result.loadType === 'playlist') {
-        await player.queue.add(result.tracks);
-      } else {
-        await player.queue.add(result.tracks[0]);
-      }
-
-      if (!player.playing && !player.paused) {
-        await player.play();
-      }
-
-      const title = result.tracks[0].info.title;
-      await interaction.editReply(
-        wasIdle ? `🎵 지금 재생: **${title}**` : `➕ 대기열에 추가됨: **${title}**`,
-      );
-    } catch (error) {
-      console.error('재생 명령어 오류:', error.message);
-      await interaction.editReply('노래를 재생하는 중 오류가 발생했어요. 다른 검색어나 링크로 시도해보세요.');
-    }
-    return;
-  }
-
-  if (interaction.commandName === '스킵') {
-    const player = client.lavalink && client.lavalink.getPlayer(guildId);
-    if (!player || !player.playing) {
-      await interaction.reply({ content: '지금 재생 중인 게 없어요.', ephemeral: true });
-      return;
-    }
-    await player.skip();
-    await interaction.reply('⏭️ 다음 곡으로 넘어갈게요.');
-    return;
-  }
-
-  if (interaction.commandName === '정지') {
-    const player = client.lavalink && client.lavalink.getPlayer(guildId);
-    if (player) await player.destroy();
-    await interaction.reply('⏹️ 재생을 멈추고 채널에서 나갔어요.');
-    return;
-  }
-
-  if (interaction.commandName === '일시정지') {
-    const player = client.lavalink && client.lavalink.getPlayer(guildId);
-    if (!player || !player.playing) {
-      await interaction.reply({ content: '지금 재생 중인 게 없어요.', ephemeral: true });
-      return;
-    }
-    await player.pause();
-    await interaction.reply('⏸️ 일시정지했어요.');
-    return;
-  }
-
-  if (interaction.commandName === '재개') {
-    const player = client.lavalink && client.lavalink.getPlayer(guildId);
-    if (!player) {
-      await interaction.reply({ content: '지금 재생 중인 게 없어요.', ephemeral: true });
-      return;
-    }
-    await player.resume();
-    await interaction.reply('▶️ 다시 재생할게요.');
-    return;
-  }
-
-  if (interaction.commandName === '대기열') {
-    const player = client.lavalink && client.lavalink.getPlayer(guildId);
-    if (!player || (!player.queue.current && player.queue.tracks.length === 0)) {
-      await interaction.reply({ content: '대기열이 비어있어요.', ephemeral: true });
-      return;
-    }
-    const lines = [];
-    if (player.queue.current) lines.push(`🎵 지금 재생 중: **${player.queue.current.info.title}**`);
-    player.queue.tracks.slice(0, 10).forEach((track, i) => {
-      lines.push(`${i + 1}. ${track.info.title}`);
-    });
-    if (player.queue.tracks.length > 10) lines.push(`...외 ${player.queue.tracks.length - 10}곡`);
-    await interaction.reply({ content: lines.join('\n'), ephemeral: true });
-    return;
-  }
-
+  // ===== 이미지 생성 (누구나 사용 가능) =====
   if (interaction.commandName === '이미지') {
     await interaction.deferReply();
 
@@ -514,6 +334,33 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } catch (error) {
       console.error('이미지 생성 오류:', error.message);
       await interaction.editReply('이미지를 생성하는 중 오류가 발생했어요. 잠시 후 다시 시도해보세요.');
+    }
+    return;
+  }
+
+  // ===== 투표 (누구나 사용 가능) =====
+  if (interaction.commandName === '투표') {
+    const NUMBER_EMOJIS = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
+    const question = interaction.options.getString('질문');
+    const choices = [1, 2, 3, 4, 5]
+      .map((i) => interaction.options.getString(`항목${i}`))
+      .filter((choice) => choice !== null);
+
+    const embed = new EmbedBuilder()
+      .setTitle(`📊 ${question}`)
+      .setDescription(choices.map((choice, i) => `${NUMBER_EMOJIS[i]} ${choice}`).join('\n'))
+      .setColor(0x57f287)
+      .setFooter({ text: `${interaction.user.displayName ?? interaction.user.username}님이 만든 투표` });
+
+    await interaction.reply({ embeds: [embed] });
+    const message = await interaction.fetchReply();
+
+    for (let i = 0; i < choices.length; i++) {
+      try {
+        await message.react(NUMBER_EMOJIS[i]);
+      } catch (error) {
+        console.error('투표 반응 추가 오류:', error.message);
+      }
     }
     return;
   }
