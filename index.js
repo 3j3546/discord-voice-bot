@@ -55,6 +55,8 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent, // 끝말잇기 채팅 내용을 읽기 위해 필요
   ],
 });
 
@@ -64,6 +66,64 @@ const guildSettings = new Map();
 
 // 채널별로 가장 최근에 만든 투표 메시지 ID를 기억합니다 (/투표종료에서 사용).
 const activePolls = new Map();
+
+// ===== 끝말잇기 =====
+// 채널별 게임 상태: { active, lastWord, usedWords: Set }
+const wordChainGames = new Map();
+
+// 한글 한 글자를 초성/중성/종성으로 분해합니다 (두음법칙 처리에 사용).
+const HANGUL_START = 0xac00;
+const HANGUL_END = 0xd7a3;
+const CHOSEONG = ['ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ', 'ㅋ', 'ㅌ', 'ㅍ', 'ㅎ'];
+const JUNGSEONG = ['ㅏ', 'ㅐ', 'ㅑ', 'ㅒ', 'ㅓ', 'ㅔ', 'ㅕ', 'ㅖ', 'ㅗ', 'ㅘ', 'ㅙ', 'ㅚ', 'ㅛ', 'ㅜ', 'ㅝ', 'ㅞ', 'ㅟ', 'ㅠ', 'ㅡ', 'ㅢ', 'ㅣ'];
+
+function isHangulSyllable(char) {
+  const code = char.charCodeAt(0);
+  return code >= HANGUL_START && code <= HANGUL_END;
+}
+
+function decompose(char) {
+  const code = char.charCodeAt(0) - HANGUL_START;
+  return { cho: CHOSEONG[Math.floor(code / 588)], jung: JUNGSEONG[Math.floor((code % 588) / 28)] };
+}
+
+// 두음법칙: 낱말 앞에서 ㄴ/ㄹ이 ㅇ/ㄴ으로 바뀌는 경우를 같이 허용합니다.
+// 예: '~력' 다음에 '역', '~녀' 다음에 '여' 로 시작해도 인정.
+function getAcceptableStartChars(lastChar) {
+  if (!isHangulSyllable(lastChar)) return [lastChar];
+  const { cho, jung } = decompose(lastChar);
+  const accepted = new Set([lastChar]);
+
+  const rules = [
+    { from: 'ㄹ', to: 'ㄴ' },
+    { from: 'ㄹ', to: 'ㅇ' },
+    { from: 'ㄴ', to: 'ㅇ' },
+  ];
+  for (const rule of rules) {
+    if (cho === rule.from) {
+      const code =
+        HANGUL_START + CHOSEONG.indexOf(rule.to) * 588 + JUNGSEONG.indexOf(jung) * 28;
+      accepted.add(String.fromCharCode(code));
+    }
+  }
+  return [...accepted];
+}
+
+function checkWordChain(game, word) {
+  if (word.length < 2) return '두 글자 이상이어야 해요.';
+  if (!/^[가-힣]+$/.test(word)) return '한글 단어만 가능해요.';
+  if (game.usedWords.has(word)) return '이미 나온 단어예요.';
+
+  if (game.lastWord) {
+    const lastChar = game.lastWord[game.lastWord.length - 1];
+    const firstChar = word[0];
+    const accepted = getAcceptableStartChars(lastChar);
+    if (!accepted.includes(firstChar)) {
+      return `**${lastChar}**(으)로 시작하는 단어를 입력해주세요.`;
+    }
+  }
+  return null; // 통과
+}
 
 function getSettings(guildId) {
   if (!guildSettings.has(guildId)) {
@@ -161,6 +221,12 @@ const commands = [
   new SlashCommandBuilder()
     .setName('투표종료')
     .setDescription('이 채널의 가장 최근 투표를 마감하고 결과를 보여줍니다'),
+  new SlashCommandBuilder()
+    .setName('끝말잇기시작')
+    .setDescription('이 채널에서 끝말잇기를 시작합니다'),
+  new SlashCommandBuilder()
+    .setName('끝말잇기종료')
+    .setDescription('이 채널의 끝말잇기를 종료합니다'),
 ].map((command) => command.toJSON());
 
 async function registerCommandsForGuild(guildId) {
@@ -445,6 +511,52 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     return;
   }
+
+  if (interaction.commandName === '끝말잇기시작') {
+    if (wordChainGames.get(interaction.channelId)?.active) {
+      await interaction.reply({ content: '이미 이 채널에서 끝말잇기가 진행 중이에요.', ephemeral: true });
+      return;
+    }
+    wordChainGames.set(interaction.channelId, { active: true, lastWord: null, usedWords: new Set() });
+    await interaction.reply(
+      '🔤 끝말잇기를 시작합니다! 아무 단어나 채팅에 입력해서 시작하세요 (두 글자 이상, 한글만).',
+    );
+    return;
+  }
+
+  if (interaction.commandName === '끝말잇기종료') {
+    const game = wordChainGames.get(interaction.channelId);
+    if (!game || !game.active) {
+      await interaction.reply({ content: '진행 중인 끝말잇기가 없어요.', ephemeral: true });
+      return;
+    }
+    wordChainGames.delete(interaction.channelId);
+    await interaction.reply(
+      `🔤 끝말잇기를 종료합니다. 총 ${game.usedWords.size}개의 단어가 나왔어요!`,
+    );
+    return;
+  }
+});
+
+// 끝말잇기 진행 중인 채널의 일반 채팅 메시지를 감시합니다.
+client.on(Events.MessageCreate, (message) => {
+  if (message.author.bot) return;
+
+  const game = wordChainGames.get(message.channelId);
+  if (!game || !game.active) return;
+
+  const word = message.content.trim();
+  const errorReason = checkWordChain(game, word);
+
+  if (errorReason) {
+    message.react('❌').catch(() => {});
+    message.reply({ content: errorReason, allowedMentions: { repliedUser: false } }).catch(() => {});
+    return;
+  }
+
+  game.usedWords.add(word);
+  game.lastWord = word;
+  message.react('✅').catch(() => {});
 });
 
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
