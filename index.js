@@ -19,6 +19,7 @@ const {
   SlashCommandBuilder,
   PermissionFlagsBits,
   EmbedBuilder,
+  AttachmentBuilder,
 } = require('discord.js');
 const {
   joinVoiceChannel,
@@ -350,9 +351,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&seed=${seed}&nologo=true`;
 
     try {
+      // Discord가 URL에서 직접 이미지를 못 가져오는 경우가 있어서,
+      // 봇이 이미지를 미리 받아온 뒤 첨부파일로 올립니다.
+      const response = await fetch(imageUrl);
+      if (!response.ok) {
+        throw new Error(`이미지 서버 응답 오류 (HTTP ${response.status})`);
+      }
+      const buffer = Buffer.from(await response.arrayBuffer());
+      const attachment = new AttachmentBuilder(buffer, { name: 'image.png' });
+
       const embed = new EmbedBuilder()
         .setTitle(originalPrompt.length > 256 ? originalPrompt.slice(0, 253) + '...' : originalPrompt)
-        .setImage(imageUrl)
+        .setImage('attachment://image.png')
         .setColor(0x5865f2)
         .setFooter({
           text:
@@ -361,7 +371,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
               : 'Pollinations.ai로 생성됨',
         });
 
-      await interaction.editReply({ embeds: [embed] });
+      await interaction.editReply({ embeds: [embed], files: [attachment] });
     } catch (error) {
       console.error('이미지 생성 오류:', error.message);
       await interaction.editReply('이미지를 생성하는 중 오류가 발생했어요. 잠시 후 다시 시도해보세요.');
