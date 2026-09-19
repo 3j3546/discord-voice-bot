@@ -18,6 +18,7 @@ const {
   Routes,
   SlashCommandBuilder,
   PermissionFlagsBits,
+  EmbedBuilder,
 } = require('discord.js');
 const {
   joinVoiceChannel,
@@ -143,6 +144,15 @@ const commands = [
   new SlashCommandBuilder()
     .setName('대기열')
     .setDescription('현재 대기열을 보여줍니다'),
+  new SlashCommandBuilder()
+    .setName('이미지')
+    .setDescription('AI로 이미지를 생성합니다')
+    .addStringOption((option) =>
+      option
+        .setName('프롬프트')
+        .setDescription('원하는 이미지에 대한 설명 (영어로 쓰면 더 잘 나와요)')
+        .setRequired(true),
+    ),
 ].map((command) => command.toJSON());
 
 async function registerCommandsForGuild(guildId) {
@@ -483,6 +493,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
     });
     if (player.queue.tracks.length > 10) lines.push(`...외 ${player.queue.tracks.length - 10}곡`);
     await interaction.reply({ content: lines.join('\n'), ephemeral: true });
+    return;
+  }
+
+  if (interaction.commandName === '이미지') {
+    await interaction.deferReply();
+
+    const prompt = interaction.options.getString('프롬프트');
+    const seed = Math.floor(Math.random() * 1_000_000); // 같은 프롬프트라도 매번 다른 이미지가 나오도록
+    const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&seed=${seed}&nologo=true`;
+
+    try {
+      const embed = new EmbedBuilder()
+        .setTitle(prompt.length > 256 ? prompt.slice(0, 253) + '...' : prompt)
+        .setImage(imageUrl)
+        .setColor(0x5865f2)
+        .setFooter({ text: 'Pollinations.ai로 생성됨' });
+
+      await interaction.editReply({ embeds: [embed] });
+    } catch (error) {
+      console.error('이미지 생성 오류:', error.message);
+      await interaction.editReply('이미지를 생성하는 중 오류가 발생했어요. 잠시 후 다시 시도해보세요.');
+    }
     return;
   }
 });
