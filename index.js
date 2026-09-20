@@ -117,11 +117,23 @@ async function fetchDictJson(query, method) {
   const key = process.env.KOREAN_DICT_API_KEY;
   const url = `https://stdict.korean.go.kr/api/search.do?key=${key}&q=${encodeURIComponent(
     query,
-  )}&req_type=json&method=${method}&part=word&num=100`;
+  )}&req_type=json&method=${method}&num=100`;
 
   const response = await fetch(url);
   if (!response.ok) throw new Error(`사전 API 응답 오류 (HTTP ${response.status})`);
-  return response.json();
+  const data = await response.json();
+
+  if (data && data.error) {
+    throw new Error(`사전 API 오류 (${data.error.error_code}): ${data.error.message}`);
+  }
+  return data;
+}
+
+// API 응답의 item은 결과가 1개면 객체, 여러 개면 배열로 옵니다. 항상 배열로 통일합니다.
+function toItemArray(data) {
+  const item = data && data.channel && data.channel.item;
+  if (!item) return [];
+  return Array.isArray(item) ? item : [item];
 }
 
 // 실제로 존재하는 단어인지 확인합니다. API 키가 없으면 항상 통과시킵니다.
@@ -131,12 +143,12 @@ async function isRealWord(word) {
 
   try {
     const data = await fetchDictJson(word, 'exact');
-    const items = (data && data.channel && data.channel.item) || [];
+    const items = toItemArray(data);
     const exists = items.some((item) => (item.word || '').replace(/-/g, '') === word);
     dictWordCache.set(word, exists);
     return exists;
   } catch (error) {
-    console.error('사전 조회 오류:', error.message);
+    console.error('사전 조회 오류(isRealWord):', error.message);
     return true; // API 오류 시에는 막지 않고 통과시킵니다.
   }
 }
@@ -148,7 +160,7 @@ async function hasFollowingWord(char, wordToExclude) {
 
   try {
     const data = await fetchDictJson(char, 'start');
-    const items = (data && data.channel && data.channel.item) || [];
+    const items = toItemArray(data);
     const hasOther = items.some((item) => {
       const w = (item.word || '').replace(/-/g, '');
       return w.length >= 2 && w !== wordToExclude;
@@ -156,7 +168,7 @@ async function hasFollowingWord(char, wordToExclude) {
     dictDeadEndCache.set(char, !hasOther);
     return hasOther;
   } catch (error) {
-    console.error('사전 조회 오류:', error.message);
+    console.error('사전 조회 오류(hasFollowingWord):', error.message);
     return true;
   }
 }
