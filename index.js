@@ -20,6 +20,9 @@ const {
   PermissionFlagsBits,
   EmbedBuilder,
   AttachmentBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
 } = require('discord.js');
 const {
   joinVoiceChannel,
@@ -70,6 +73,21 @@ const activePolls = new Map();
 // ===== 끝말잇기 =====
 // 채널별 게임 상태: { active, lastWord, usedWords: Set }
 const wordChainGames = new Map();
+
+// ===== 가위바위보 =====
+// 채널별 상태: { players: Map(userId -> { choice, username }) }
+const rpsGames = new Map();
+
+const RPS_LABELS = { scissors: '가위 ✂️', rock: '바위 ✊', paper: '보 ✋' };
+const RPS_BEATS = { scissors: 'paper', rock: 'scissors', paper: 'rock' }; // key가 value를 이김
+
+function buildRpsRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('rps_scissors').setLabel('가위').setEmoji('✂️').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('rps_rock').setLabel('바위').setEmoji('✊').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('rps_paper').setLabel('보').setEmoji('✋').setStyle(ButtonStyle.Secondary),
+  );
+}
 
 // 한글 한 글자를 초성/중성/종성으로 분해합니다 (두음법칙 처리에 사용).
 const HANGUL_START = 0xac00;
@@ -312,6 +330,9 @@ const commands = [
   new SlashCommandBuilder()
     .setName('끝말잇기종료')
     .setDescription('이 채널의 끝말잇기를 종료합니다'),
+  new SlashCommandBuilder()
+    .setName('가위바위보')
+    .setDescription('버튼으로 진행하는 가위바위보 (최대 2명)'),
 ].map((command) => command.toJSON());
 
 async function registerCommandsForGuild(guildId) {
@@ -448,6 +469,50 @@ client.on(Events.GuildCreate, (guild) => {
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
+  if (interaction.isButton() && interaction.customId.startsWith('rps_')) {
+    if (!interaction.inGuild()) return;
+    const game = rpsGames.get(interaction.channelId);
+    if (!game) {
+      await interaction.reply({ content: '진행 중인 가위바위보가 없어요. `/가위바위보`로 새로 시작해주세요.', ephemeral: true });
+      return;
+    }
+
+    const choice = interaction.customId.replace('rps_', ''); // scissors | rock | paper
+    const userId = interaction.user.id;
+
+    if (!game.players.has(userId) && game.players.size >= 2) {
+      await interaction.reply({ content: '이미 두 명이 참가했어요.', ephemeral: true });
+      return;
+    }
+
+    game.players.set(userId, { choice, username: interaction.user.displayName ?? interaction.user.username });
+    await interaction.reply({ content: `${RPS_LABELS[choice]}(을)를 선택했어요!`, ephemeral: true });
+
+    if (game.players.size < 2) return;
+
+    const [[id1, p1], [id2, p2]] = [...game.players.entries()];
+
+    if (p1.choice === p2.choice) {
+      game.players.clear();
+      await interaction.message.edit({
+        content: `🤜🤛 비겼습니다 (둘 다 ${RPS_LABELS[p1.choice]})! 다시 진행할게요.`,
+        components: [buildRpsRow()],
+      });
+      return;
+    }
+
+    const winnerIsP1 = RPS_BEATS[p1.choice] === p2.choice;
+    const winner = winnerIsP1 ? p1 : p2;
+    const loser = winnerIsP1 ? p2 : p1;
+
+    rpsGames.delete(interaction.channelId);
+    await interaction.message.edit({
+      content: `${winner.username}(${RPS_LABELS[winner.choice]}) vs ${loser.username}(${RPS_LABELS[loser.choice]})\n🏆 **${winner.username}님이 승리하셨습니다.**`,
+      components: [],
+    });
+    return;
+  }
+
   if (!interaction.isChatInputCommand() || !interaction.inGuild()) return;
 
   const member = interaction.member;
@@ -634,43 +699,57 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     return;
   }
+
+  if (interaction.commandName === '가위바위보') {
+    if (rpsGames.get(interaction.channelId)) {
+      await interaction.reply({ content: '이미 이 채널에서 가위바위보가 진행 중이에요.', ephemeral: true });
+      return;
+    }
+    rpsGames.set(interaction.channelId, { players: new Map() });
+    await interaction.reply({
+      content: '✂️✊✋ 가위바위보! 아래 버튼을 눌러 선택하세요 (최대 2명 참가).',
+      components: [buildRpsRow()],
+    });
+    return;
+  }
 });
 
 // 끝말잇기 진행 중인 채널의 일반 채팅 메시지를 감시합니다.
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
 
-  const game = wordChainGames.get(message.channelId);
-  if (!game || !game.active) return;
+  const wordChainGame = wordChainGames.get(message.channelId);
+  if (wordChainGame && wordChainGame.active) {
+    const word = message.content.trim();
+    const result = await checkWordChain(wordChainGame, word);
 
-  const word = message.content.trim();
-  const result = await checkWordChain(game, word);
+    if (result === null) {
+      wordChainGame.usedWords.add(word);
+      wordChainGame.lastWord = word;
+      wordChainGame.secondLastAuthorId = wordChainGame.lastAuthorId;
+      wordChainGame.lastAuthorId = message.author.id;
+      message.react('✅').catch(() => {});
+      return;
+    }
 
-  if (result === null) {
-    game.usedWords.add(word);
-    game.lastWord = word;
-    game.secondLastAuthorId = game.lastAuthorId;
-    game.lastAuthorId = message.author.id;
-    message.react('✅').catch(() => {});
+    if (typeof result === 'object' && result.win) {
+      // 한방단어! 낸 사람이 승리, 직전에 단어를 낸 사람이 패배.
+      wordChainGames.delete(message.channelId);
+      message.react('🏆').catch(() => {});
+      message
+        .reply({
+          content: `**${word}**는 한방단어예요!\n<@${message.author.id}>님 승리 🏆 <@${wordChainGame.lastAuthorId}>님 패배`,
+          allowedMentions: { repliedUser: false },
+        })
+        .catch(() => {});
+      return;
+    }
+
+    // 실패 사유 문자열
+    message.react('❌').catch(() => {});
+    message.reply({ content: result, allowedMentions: { repliedUser: false } }).catch(() => {});
     return;
   }
-
-  if (typeof result === 'object' && result.win) {
-    // 한방단어! 낸 사람이 승리, 직전에 단어를 낸 사람이 패배.
-    wordChainGames.delete(message.channelId);
-    message.react('🏆').catch(() => {});
-    message
-      .reply({
-        content: `**${word}**는 한방단어예요!\n<@${message.author.id}>님 승리 🏆 <@${game.lastAuthorId}>님 패배`,
-        allowedMentions: { repliedUser: false },
-      })
-      .catch(() => {});
-    return;
-  }
-
-  // 실패 사유 문자열
-  message.react('❌').catch(() => {});
-  message.reply({ content: result, allowedMentions: { repliedUser: false } }).catch(() => {});
 });
 
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
