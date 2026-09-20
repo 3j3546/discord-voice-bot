@@ -333,6 +333,12 @@ const commands = [
   new SlashCommandBuilder()
     .setName('가위바위보')
     .setDescription('버튼으로 진행하는 가위바위보 (최대 2명)'),
+  new SlashCommandBuilder()
+    .setName('날씨')
+    .setDescription('특정 지역의 오늘 날씨를 알려줍니다')
+    .addStringOption((option) =>
+      option.setName('지역').setDescription('예: 청주시, 서울, 부산').setRequired(true),
+    ),
 ].map((command) => command.toJSON());
 
 async function registerCommandsForGuild(guildId) {
@@ -710,6 +716,45 @@ client.on(Events.InteractionCreate, async (interaction) => {
       content: '✂️✊✋ 가위바위보! 아래 버튼을 눌러 선택하세요 (최대 2명 참가).',
       components: [buildRpsRow()],
     });
+    return;
+  }
+
+  if (interaction.commandName === '날씨') {
+    await interaction.deferReply();
+    const region = interaction.options.getString('지역');
+
+    try {
+      const response = await fetch(
+        `https://wttr.in/${encodeURIComponent(region)}?format=j1&lang=ko`,
+      );
+      if (!response.ok) throw new Error(`날씨 API 응답 오류 (HTTP ${response.status})`);
+      const data = await response.json();
+
+      const current = data.current_condition[0];
+      const today = data.weather[0];
+      const description =
+        (current.lang_ko && current.lang_ko[0] && current.lang_ko[0].value) ||
+        current.weatherDesc[0].value;
+
+      const closings = [
+        '오늘도 좋은 하루 보내세요! ☀️',
+        '즐거운 하루 되세요! 😊',
+        '행복한 하루 보내세요! 🌈',
+        '오늘 하루도 화이팅이에요! 💪',
+      ];
+      const closing = closings[Math.floor(Math.random() * closings.length)];
+
+      const reply =
+        `📍 **${region}**의 오늘 날씨는 **${description}**이에요.\n` +
+        `🌡️ 현재 기온 ${current.temp_C}°C (체감 ${current.FeelsLikeC}°C) · 최고 ${today.maxtempC}°C / 최저 ${today.mintempC}°C\n` +
+        `💧 습도 ${current.humidity}%\n\n` +
+        closing;
+
+      await interaction.editReply(reply);
+    } catch (error) {
+      console.error('날씨 조회 오류:', error.message);
+      await interaction.editReply('날씨 정보를 가져오는 중 오류가 발생했어요. 지역 이름을 다시 확인해보세요.');
+    }
     return;
   }
 });
