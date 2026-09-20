@@ -117,7 +117,7 @@ async function fetchDictJson(query, method) {
   const key = process.env.KOREAN_DICT_API_KEY;
   const url = `https://stdict.korean.go.kr/api/search.do?key=${key}&q=${encodeURIComponent(
     query,
-  )}&req_type=json&method=${method}&num=100`;
+  )}&req_type=json&method=${method}&advanced=y&num=100`;
 
   const response = await fetch(url);
   if (!response.ok) throw new Error(`사전 API 응답 오류 (HTTP ${response.status})`);
