@@ -109,26 +109,30 @@ function getAcceptableStartChars(lastChar) {
   return [...accepted];
 }
 
-// ===== 한국어 위키낱말사전(Wiktionary) 연동 — API 키/가입 불필요 =====
+// ===== 국립국어원 표준국어대사전 Open API 연동 =====
 const dictWordCache = new Map(); // 단어 -> 실존 여부(boolean)
 const dictDeadEndCache = new Map(); // 글자 -> 한방단어(다음 이을 말이 없음) 여부(boolean)
 
-async function fetchWiktionary(params) {
-  const url = `https://ko.wiktionary.org/w/api.php?format=json&${params}`;
+async function fetchDictJson(query, method) {
+  const key = process.env.KOREAN_DICT_API_KEY;
+  const url = `https://stdict.korean.go.kr/api/search.do?key=${key}&q=${encodeURIComponent(
+    query,
+  )}&req_type=json&method=${method}&part=word&num=100`;
+
   const response = await fetch(url);
   if (!response.ok) throw new Error(`사전 API 응답 오류 (HTTP ${response.status})`);
   return response.json();
 }
 
-// 실제로 존재하는 단어인지 확인합니다 (위키낱말사전에 등재된 표제어인지).
+// 실제로 존재하는 단어인지 확인합니다. API 키가 없으면 항상 통과시킵니다.
 async function isRealWord(word) {
   if (dictWordCache.has(word)) return dictWordCache.get(word);
+  if (!process.env.KOREAN_DICT_API_KEY) return true;
 
   try {
-    const data = await fetchWiktionary(`action=query&titles=${encodeURIComponent(word)}`);
-    const pages = (data && data.query && data.query.pages) || {};
-    const page = Object.values(pages)[0];
-    const exists = !!(page && !('missing' in page));
+    const data = await fetchDictJson(word, 'exact');
+    const items = (data && data.channel && data.channel.item) || [];
+    const exists = items.some((item) => (item.word || '').replace(/-/g, '') === word);
     dictWordCache.set(word, exists);
     return exists;
   } catch (error) {
@@ -140,15 +144,15 @@ async function isRealWord(word) {
 // 이 글자로 시작하는 다른 단어가 사전에 있는지 확인합니다 (없으면 한방단어).
 async function hasFollowingWord(char, wordToExclude) {
   if (dictDeadEndCache.has(char)) return !dictDeadEndCache.get(char);
+  if (!process.env.KOREAN_DICT_API_KEY) return true; // API 키가 없으면 한방단어 판정을 하지 않습니다.
 
   try {
-    const data = await fetchWiktionary(
-      `action=query&list=allpages&apprefix=${encodeURIComponent(char)}&aplimit=50`,
-    );
-    const pages = (data && data.query && data.query.allpages) || [];
-    const hasOther = pages.some(
-      (page) => page.title.length >= 2 && page.title !== wordToExclude && /^[가-힣]+$/.test(page.title),
-    );
+    const data = await fetchDictJson(char, 'start');
+    const items = (data && data.channel && data.channel.item) || [];
+    const hasOther = items.some((item) => {
+      const w = (item.word || '').replace(/-/g, '');
+      return w.length >= 2 && w !== wordToExclude;
+    });
     dictDeadEndCache.set(char, !hasOther);
     return hasOther;
   } catch (error) {
