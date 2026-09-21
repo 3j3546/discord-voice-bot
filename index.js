@@ -243,19 +243,30 @@ function voiceLabel(voice) {
   return voice === DEFAULT_VOICE ? '남자 (인준)' : '여자 (선희)';
 }
 
+// MyMemory 무료 번역 API를 이용한 번역 (가입/API 키 불필요).
+// source를 안 주면 한국어 포함 여부로 자동 추정합니다.
+async function translateText(text, target, source) {
+  const hasKorean = /[\u3131-\uD79D]/.test(text);
+  const src = source || (hasKorean ? 'ko' : 'en');
+  if (src === target) return text;
+
+  const response = await fetch(
+    `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${src}|${target}`,
+  );
+  const data = await response.json();
+  const translated = data && data.responseData && data.responseData.translatedText;
+  if (!translated) throw new Error('번역 결과를 받지 못했어요.');
+  return translated;
+}
+
 // 한국어가 섞인 프롬프트를 영어로 번역합니다 (이미지 생성 모델이 영어를 훨씬 잘 이해하기 때문).
-// 무료 번역 API(MyMemory)를 사용하며, 실패하면 원문을 그대로 반환합니다.
+// 실패하면 원문을 그대로 반환합니다.
 async function translateToEnglishIfKorean(text) {
   const hasKorean = /[\u3131-\uD79D]/.test(text);
   if (!hasKorean) return text;
 
   try {
-    const response = await fetch(
-      `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=ko|en`,
-    );
-    const data = await response.json();
-    const translated = data && data.responseData && data.responseData.translatedText;
-    return translated || text;
+    return await translateText(text, 'en', 'ko');
   } catch (error) {
     console.error('번역 실패:', error.message);
     return text;
@@ -338,6 +349,28 @@ const commands = [
     .setDescription('특정 지역의 오늘 날씨를 알려줍니다')
     .addStringOption((option) =>
       option.setName('지역').setDescription('예: 청주시, 서울, 부산').setRequired(true),
+    ),
+  new SlashCommandBuilder()
+    .setName('번역')
+    .setDescription('텍스트를 원하는 언어로 번역합니다')
+    .addStringOption((option) =>
+      option.setName('텍스트').setDescription('번역할 내용').setRequired(true),
+    )
+    .addStringOption((option) =>
+      option
+        .setName('언어')
+        .setDescription('번역할 언어')
+        .setRequired(true)
+        .addChoices(
+          { name: '한국어', value: 'ko' },
+          { name: '영어', value: 'en' },
+          { name: '일본어', value: 'ja' },
+          { name: '중국어', value: 'zh-CN' },
+          { name: '스페인어', value: 'es' },
+          { name: '프랑스어', value: 'fr' },
+          { name: '독일어', value: 'de' },
+          { name: '베트남어', value: 'vi' },
+        ),
     ),
 ].map((command) => command.toJSON());
 
@@ -754,6 +787,37 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } catch (error) {
       console.error('날씨 조회 오류:', error.message);
       await interaction.editReply('날씨 정보를 가져오는 중 오류가 발생했어요. 지역 이름을 다시 확인해보세요.');
+    }
+    return;
+  }
+
+  if (interaction.commandName === '번역') {
+    await interaction.deferReply();
+    const text = interaction.options.getString('텍스트');
+    const targetLang = interaction.options.getString('언어');
+    const langLabel = {
+      ko: '한국어',
+      en: '영어',
+      ja: '일본어',
+      'zh-CN': '중국어',
+      es: '스페인어',
+      fr: '프랑스어',
+      de: '독일어',
+      vi: '베트남어',
+    }[targetLang];
+
+    try {
+      const translated = await translateText(text, targetLang);
+      const embed = new EmbedBuilder()
+        .setColor(0x4285f4)
+        .addFields(
+          { name: '원문', value: text.length > 1024 ? text.slice(0, 1021) + '...' : text },
+          { name: `번역 (${langLabel})`, value: translated.length > 1024 ? translated.slice(0, 1021) + '...' : translated },
+        );
+      await interaction.editReply({ embeds: [embed] });
+    } catch (error) {
+      console.error('번역 오류:', error.message);
+      await interaction.editReply('번역하는 중 오류가 발생했어요. 잠시 후 다시 시도해보세요.');
     }
     return;
   }
