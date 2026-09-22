@@ -245,13 +245,16 @@ function voiceLabel(voice) {
 
 // MyMemory 무료 번역 API를 이용한 번역 (가입/API 키 불필요).
 // source를 안 주면 한국어 포함 여부로 자동 추정합니다.
+// MYMEMORY_EMAIL 환경변수를 넣으면 하루 한도가 5,000자 → 50,000자로 늘어납니다 (가입/인증 불필요, 그냥 붙이면 됨).
 async function translateText(text, target, source) {
   const hasKorean = /[\u3131-\uD79D]/.test(text);
   const src = source || (hasKorean ? 'ko' : 'en');
   if (src === target) return text;
 
+  const email = process.env.MYMEMORY_EMAIL;
+  const emailParam = email ? `&de=${encodeURIComponent(email)}` : '';
   const response = await fetch(
-    `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${src}|${target}`,
+    `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${src}|${target}${emailParam}`,
   );
   const data = await response.json();
   const translated = data && data.responseData && data.responseData.translatedText;
@@ -875,14 +878,14 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
 
   // 음성채널에서 완전히 퇴장
   if (oldState.channelId && !newState.channelId) {
-    speak(oldState.channel, `${nickname}님이 퇴장했습니다`);
+    speak(oldState.channel, `${nickname}님이 퇴장했습네다.김정은 수령동지께 만세!무현쨩`);
     return;
   }
 
   // 다른 음성채널로 이동
   if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
     speak(oldState.channel, `${nickname}님이 채널을 이동했습니다`);
-    speak(newState.channel, `${nickname}님이 입장했습니다`);
+    speak(newState.channel, `${nickname}님이 입장하였습네다.김정은 수령동지께 만세!무현쨩`);
   }
 });
 
