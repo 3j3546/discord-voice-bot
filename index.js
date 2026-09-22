@@ -375,6 +375,27 @@ const commands = [
           { name: '베트남어', value: 'vi' },
         ),
     ),
+  new SlashCommandBuilder()
+    .setName('점수판')
+    .setDescription('오늘의 KBO 야구 경기 점수를 보여줍니다')
+    .addStringOption((option) =>
+      option
+        .setName('구단')
+        .setDescription('KBO 구단 선택')
+        .setRequired(true)
+        .addChoices(
+          { name: '두산 베어스', value: '두산' },
+          { name: 'LG 트윈스', value: 'LG' },
+          { name: '키움 히어로즈', value: '키움' },
+          { name: 'SSG 랜더스', value: 'SSG' },
+          { name: 'NC 다이노스', value: 'NC' },
+          { name: 'KIA 타이거즈', value: 'KIA' },
+          { name: '삼성 라이온즈', value: '삼성' },
+          { name: '롯데 자이언츠', value: '롯데' },
+          { name: '한화 이글스', value: '한화' },
+          { name: 'KT 위즈', value: 'KT' },
+        ),
+    ),
 ].map((command) => command.toJSON());
 
 async function registerCommandsForGuild(guildId) {
@@ -824,6 +845,52 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     return;
   }
+
+  if (interaction.commandName === '점수판') {
+    await interaction.deferReply();
+    const team = interaction.options.getString('구단');
+
+    try {
+      const kstDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Seoul' }).format(new Date());
+      const url = `https://api-gw.sports.naver.com/schedule/games?fields=basic,schedule,baseball&fromDate=${kstDate}&toDate=${kstDate}&upperCategoryId=kbaseball&categoryId=kbo&size=50`;
+
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`데이터 조회 오류 (HTTP ${response.status})`);
+      const data = await response.json();
+      const games = (data && data.result && data.result.games) || [];
+
+      const game = games.find((g) => {
+        const home = (g.homeTeamName || '').toUpperCase();
+        const away = (g.awayTeamName || '').toUpperCase();
+        return home.includes(team.toUpperCase()) || away.includes(team.toUpperCase());
+      });
+
+      if (!game) {
+        await interaction.editReply(`오늘 **${team}** 경기가 없거나 정보를 찾을 수 없어요.`);
+        console.log('점수판 디버그(경기 못 찾음):', JSON.stringify(games).slice(0, 1500));
+        return;
+      }
+
+      const statusText = game.statusInfo || game.statusCode || '정보 없음';
+      const homeScore = game.homeTeamScore ?? game.homeScore ?? '-';
+      const awayScore = game.awayTeamScore ?? game.awayScore ?? '-';
+
+      const embed = new EmbedBuilder()
+        .setTitle(`⚾ ${game.awayTeamName} vs ${game.homeTeamName}`)
+        .setDescription(
+          `**${game.awayTeamName} ${awayScore} : ${homeScore} ${game.homeTeamName}**\n` +
+            `상태: ${statusText}` +
+            (game.stadium ? `\n구장: ${game.stadium}` : ''),
+        )
+        .setColor(0xed4245);
+
+      await interaction.editReply({ embeds: [embed] });
+    } catch (error) {
+      console.error('점수판 조회 오류:', error.message);
+      await interaction.editReply('경기 정보를 가져오는 중 오류가 발생했어요. 잠시 후 다시 시도해보세요.');
+    }
+    return;
+  }
 });
 
 // 끝말잇기 진행 중인 채널의 일반 채팅 메시지를 감시합니다.
@@ -878,14 +945,14 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
 
   // 음성채널에서 완전히 퇴장
   if (oldState.channelId && !newState.channelId) {
-    speak(oldState.channel, `${nickname}님이 퇴장했습네다.김정은 수령동지께 만세!무현쨩`);
+    speak(oldState.channel, `${nickname}님이 퇴장했습니다`);
     return;
   }
 
   // 다른 음성채널로 이동
   if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
     speak(oldState.channel, `${nickname}님이 채널을 이동했습니다`);
-    speak(newState.channel, `${nickname}님이 입장하였습네다.김정은 수령동지께 만세!무현쨩`);
+    speak(newState.channel, `${nickname}님이 입장했습니다`);
   }
 });
 
