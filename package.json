@@ -4,6 +4,9 @@
   "description": "음성채널 입장/퇴장을 TTS 음성으로 알려주는 디스코드 봇",
   "main": "index.js",
   "type": "commonjs",
+  "engines": {
+    "node": "20.x"
+  },
   "scripts": {
     "start": "node index.js"
   },
