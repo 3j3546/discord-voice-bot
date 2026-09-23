@@ -3,10 +3,10 @@ require('dotenv').config();
 // 외부 라이브러리에서 예기치 못한 오류가 나도
 // 봇 전체(입퇴장 안내 포함)가 죽지 않도록 안전장치를 겁니다.
 process.on('uncaughtException', (error) => {
-  console.error('⚠️ 처리되지 않은 예외 발생 (봇은 계속 실행됩니다):', error.message);
+  console.error('⚠️ 처리되지 않은 예외 발생 (봇은 계속 실행됩니다):', error.stack || error);
 });
 process.on('unhandledRejection', (reason) => {
-  console.error('⚠️ 처리되지 않은 Promise 거부 발생 (봇은 계속 실행됩니다):', reason);
+  console.error('⚠️ 처리되지 않은 Promise 거부 발생 (봇은 계속 실행됩니다):', (reason && reason.stack) || reason);
 });
 
 const http = require('http');
@@ -35,6 +35,24 @@ const {
   StreamType,
 } = require('@discordjs/voice');
 const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
+
+// 외부 API가 응답을 안 주고 멈춰버리는(행) 경우를 대비해,
+// 일정 시간(기본 8초)이 지나면 강제로 실패 처리하는 fetch 래퍼입니다.
+// 이게 없으면 fetch가 영원히 안 끝나서 슬래시 명령어가 "응답 없음" 상태로 멈춰버릴 수 있습니다.
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error(`요청이 ${timeoutMs / 1000}초 안에 응답하지 않아 취소했어요.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // ===== 기본 음성 설정 (/목소리, /속도 명령어로 서버별로 바꿀 수 있습니다) =====
 const DEFAULT_VOICE = 'ko-KR-InJoonNeural'; // 남자 목소리. 여자 목소리는 'ko-KR-SunHiNeural'
@@ -137,7 +155,7 @@ async function fetchDictJson(query, method) {
     query,
   )}&req_type=json&method=${method}&advanced=y&num=100`;
 
-  const response = await fetch(url);
+  const response = await fetchWithTimeout(url);
   if (!response.ok) throw new Error(`사전 API 응답 오류 (HTTP ${response.status})`);
   const data = await response.json();
 
@@ -253,7 +271,7 @@ async function translateText(text, target, source) {
 
   const email = process.env.MYMEMORY_EMAIL;
   const emailParam = email ? `&de=${encodeURIComponent(email)}` : '';
-  const response = await fetch(
+  const response = await fetchWithTimeout(
     `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${src}|${target}${emailParam}`,
   );
   const data = await response.json();
@@ -531,7 +549,33 @@ client.on(Events.GuildCreate, (guild) => {
   registerCommandsForGuild(guild.id);
 });
 
+// Render 무료 서버는 일정 시간 요청이 없으면 잠들었다가, 다음 요청이 올 때
+// 깨어나는 데 시간이 걸릴 수 있습니다(콜드 스타트). 이 사이 디스코드 인터랙션이
+// 도착하면, 봇이 깨어나서 응답하기도 전에 디스코드가 그 인터랙션을 무효화시켜
+// "Unknown interaction" 오류가 나고 명령어가 전부 먹통이 됩니다.
+// 아래 로그로 실제 원인이 이것인지 확인할 수 있습니다.
+client.ws.on('shardDisconnect', () => console.warn('⚠️ 디스코드 연결이 끊겼습니다 (shardDisconnect)'));
+client.ws.on('shardReconnecting', () => console.warn('⚠️ 디스코드에 재연결을 시도합니다 (shardReconnecting)'));
+client.ws.on('shardResume', () => console.warn('✅ 디스코드 연결이 재개되었습니다 (shardResume)'));
+setInterval(() => {
+  console.log(`(상태 점검) 디스코드 핑: ${client.ws.ping}ms`);
+}, 5 * 60 * 1000);
+
 client.on(Events.InteractionCreate, async (interaction) => {
+ try {
+  if (interaction.isChatInputCommand()) {
+    // 인터랙션이 디스코드에서 생성된 시각과 지금(핸들러 진입 시각)의 차이를 잽니다.
+    // 이 값이 이미 2~3초를 넘으면, 봇 코드 문제가 아니라 서버가 잠들어있다가
+    // 늦게 깨어난 것(콜드 스타트)이 원인이라는 뜻입니다.
+    const delay = Date.now() - interaction.createdTimestamp;
+    if (delay > 2000) {
+      console.warn(
+        `⚠️ 인터랙션(/${interaction.commandName}) 처리 시작이 ${delay}ms 지연됐어요. ` +
+          `서버가 잠들어있다가 늦게 깨어났을 가능성이 높아요 (Render 무료 플랜의 콜드 스타트).`,
+      );
+    }
+  }
+
   if (interaction.isButton() && interaction.customId.startsWith('rps_')) {
     if (!interaction.inGuild()) return;
     const game = rpsGames.get(interaction.channelId);
@@ -632,7 +676,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     try {
       // Discord가 URL에서 직접 이미지를 못 가져오는 경우가 있어서,
       // 봇이 이미지를 미리 받아온 뒤 첨부파일로 올립니다.
-      const response = await fetch(imageUrl);
+      const response = await fetchWithTimeout(imageUrl, {}, 20000);
       if (!response.ok) {
         throw new Error(`이미지 서버 응답 오류 (HTTP ${response.status})`);
       }
@@ -652,7 +696,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.editReply({ embeds: [embed], files: [attachment] });
     } catch (error) {
-      console.error('이미지 생성 오류:', error.message);
+      console.error('이미지 생성 오류:', error.stack || error);
       await interaction.editReply('이미지를 생성하는 중 오류가 발생했어요. 잠시 후 다시 시도해보세요.');
     }
     return;
@@ -781,7 +825,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const region = interaction.options.getString('지역');
 
     try {
-      const response = await fetch(
+      const response = await fetchWithTimeout(
         `https://wttr.in/${encodeURIComponent(region)}?format=j1&lang=ko`,
       );
       if (!response.ok) throw new Error(`날씨 API 응답 오류 (HTTP ${response.status})`);
@@ -809,7 +853,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.editReply(reply);
     } catch (error) {
-      console.error('날씨 조회 오류:', error.message);
+      console.error('날씨 조회 오류:', error.stack || error);
       await interaction.editReply('날씨 정보를 가져오는 중 오류가 발생했어요. 지역 이름을 다시 확인해보세요.');
     }
     return;
@@ -840,7 +884,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         );
       await interaction.editReply({ embeds: [embed] });
     } catch (error) {
-      console.error('번역 오류:', error.message);
+      console.error('번역 오류:', error.stack || error);
       await interaction.editReply('번역하는 중 오류가 발생했어요. 잠시 후 다시 시도해보세요.');
     }
     return;
@@ -854,7 +898,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const kstDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Seoul' }).format(new Date());
       const url = `https://api-gw.sports.naver.com/schedule/games?fields=basic,schedule,baseball&fromDate=${kstDate}&toDate=${kstDate}&upperCategoryId=kbaseball&categoryId=kbo&size=50`;
 
-      const response = await fetch(url);
+      const response = await fetchWithTimeout(url);
       if (!response.ok) throw new Error(`데이터 조회 오류 (HTTP ${response.status})`);
       const data = await response.json();
       const games = (data && data.result && data.result.games) || [];
@@ -886,11 +930,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.editReply({ embeds: [embed] });
     } catch (error) {
-      console.error('점수판 조회 오류:', error.message);
+      console.error('점수판 조회 오류:', error.stack || error);
       await interaction.editReply('경기 정보를 가져오는 중 오류가 발생했어요. 잠시 후 다시 시도해보세요.');
     }
     return;
   }
+ } catch (error) {
+  // 위 명령어 처리 중 어디선가든 예기치 못한 오류가 나면 여기서 잡습니다.
+  // error.message만이 아니라 전체 스택을 찍어서, 다음에 문제가 또 생기면
+  // Render 로그에서 정확히 몇 번째 줄에서 터졌는지 바로 알 수 있게 합니다.
+  console.error('⚠️ 인터랙션 처리 중 오류:', error.stack || error);
+  try {
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply('처리 중 오류가 발생했어요. 잠시 후 다시 시도해주세요.');
+    } else if (interaction.isRepliable && interaction.isRepliable()) {
+      await interaction.reply({ content: '처리 중 오류가 발생했어요. 잠시 후 다시 시도해주세요.', ephemeral: true });
+    }
+  } catch (replyError) {
+    console.error('⚠️ 오류 응답 전송도 실패:', replyError.message);
+  }
+ }
 });
 
 // 끝말잇기 진행 중인 채널의 일반 채팅 메시지를 감시합니다.
