@@ -1,5 +1,16 @@
 require('dotenv').config();
 
+// Render 같은 컨테이너 환경에서는 IPv6 경로가 막혀있는데 Node가 IPv6를 먼저
+// 시도하다가 응답도 에러도 없이 그냥 멈춰버리는(hang) 경우가 있습니다.
+// (에러 로그가 하나도 안 찍히면서 로그인이 영원히 안 끝나는 지금 증상과 정확히
+// 일치합니다.) IPv4를 먼저 쓰도록 강제해서 이 문제를 우회합니다.
+try {
+  require('dns').setDefaultResultOrder('ipv4first');
+  console.log('🌐 네트워크 조회 순서를 IPv4 우선으로 설정했어요.');
+} catch (error) {
+  console.error('⚠️ DNS 우선순위 설정 실패(무시하고 계속 진행합니다):', error.message);
+}
+
 // 외부 라이브러리에서 예기치 못한 오류가 나도
 // 봇 전체(입퇴장 안내 포함)가 죽지 않도록 안전장치를 겁니다.
 process.on('uncaughtException', (error) => {
