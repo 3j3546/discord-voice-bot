@@ -1015,4 +1015,28 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+// 로그인이 조용히 멈춰버리는 경우를 잡아내기 위한 진단 코드입니다.
+// 정상이면 몇 초 안에 "✅ 로그인 완료" 로그가 떠야 합니다. 이게 안 뜨면
+// 아래에서 "로그인이 000초가 지나도 완료되지 않았어요" 경고가 대신 뜨면서
+// DISCORD_TOKEN이 잘못됐거나 네트워크 문제라는 걸 알 수 있게 해줍니다.
+if (!process.env.DISCORD_TOKEN) {
+  console.error('❌ DISCORD_TOKEN 환경변수가 비어있어요. Render의 Environment 설정을 확인해주세요.');
+} else {
+  console.log('🔌 디스코드에 로그인을 시도합니다...');
+
+  const loginWatchdog = setTimeout(() => {
+    console.error(
+      '⚠️ 로그인을 시도한 지 20초가 지났는데도 완료되지 않았어요. ' +
+        'DISCORD_TOKEN 값이 잘못됐거나(디스코드 개발자 포털에서 토큰을 재발급했다면 Render 쪽 값도 바꿔야 함), ' +
+        '네트워크 문제로 디스코드 게이트웨이에 연결하지 못하고 있을 가능성이 높아요.',
+    );
+  }, 20000);
+
+  client
+    .login(process.env.DISCORD_TOKEN)
+    .then(() => clearTimeout(loginWatchdog))
+    .catch((error) => {
+      clearTimeout(loginWatchdog);
+      console.error('❌ 로그인 실패:', error.stack || error);
+    });
+}
