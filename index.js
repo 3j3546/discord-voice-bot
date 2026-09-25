@@ -65,6 +65,31 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
   }
 }
 
+// 이미지 생성 서버(Pollinations.ai)는 무료라 타임아웃/429(요청 폭주)/5xx(서버 오류)가
+// 종종 생깁니다. 재시도할 가치가 있는 실패(타임아웃, 429, 5xx)일 때만 간격을 두고
+// 최대 3번까지 다시 시도하고, 그 외(4xx 등)는 바로 결과를 돌려줍니다.
+async function fetchImageWithRetries(url, maxAttempts = 3) {
+  let lastError = null;
+  let lastResponse = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetchWithTimeout(url, {}, 45000);
+      if (response.ok) return { response };
+      lastResponse = response;
+      if (response.status !== 429 && response.status < 500) {
+        return { response }; // 재시도해도 소용없는 오류는 바로 반환
+      }
+    } catch (error) {
+      lastError = error;
+      lastResponse = null;
+    }
+    if (attempt < maxAttempts) {
+      await new Promise((resolve) => setTimeout(resolve, 3000 * attempt));
+    }
+  }
+  return { response: lastResponse, error: lastError };
+}
+
 // ===== 기본 음성 설정 (/목소리, /속도 명령어로 서버별로 바꿀 수 있습니다) =====
 const DEFAULT_VOICE = 'ko-KR-InJoonNeural'; // 남자 목소리. 여자 목소리는 'ko-KR-SunHiNeural'
 const DEFAULT_RATE = 25; // 기본 속도(%). 0이 보통 속도, 25면 25% 빠르게
@@ -754,44 +779,35 @@ client.on(Events.InteractionCreate, async (interaction) => {
     try {
       // Discord가 URL에서 직접 이미지를 못 가져오는 경우가 있어서,
       // 봇이 이미지를 미리 받아온 뒤 첨부파일로 올립니다.
-      // Pollinations.ai 무료 서버는 그림을 그리는 데 20초 넘게 걸릴 때도 있고,
-      // 요청이 몰리면 일시적으로 429(너무 많은 요청)를 돌려줄 때도 있어서,
-      // 타임아웃을 넉넉히 주고 한 번 실패하면 자동으로 한 번 더 시도합니다.
+      // Pollinations.ai는 무료 서버라 그림 그리는 데 시간이 오래 걸리거나(타임아웃),
+      // 요청이 몰리거나(429), 서버 쪽 일시적인 문제(5xx)가 종종 생겨서,
+      // 최대 3번까지 간격을 두고 자동으로 재시도합니다.
       // (이미 deferReply를 해놔서 최대 15분까지는 여유롭게 기다렸다가 답할 수 있어요.)
-      const IMAGE_TIMEOUT_MS = 45000;
-      let response;
-      let timedOut = false;
-      try {
-        response = await fetchWithTimeout(imageUrl, {}, IMAGE_TIMEOUT_MS);
-      } catch (error) {
-        timedOut = true;
-      }
+      const { response, error: fetchError } = await fetchImageWithRetries(imageUrl);
 
-      if (timedOut || (response && response.status === 429)) {
-        await new Promise((resolve) => setTimeout(resolve, 3000));
-        try {
-          response = await fetchWithTimeout(imageUrl, {}, IMAGE_TIMEOUT_MS);
-          timedOut = false;
-        } catch (error) {
-          timedOut = true;
-        }
-      }
-
-      if (timedOut) {
+      if (!response) {
+        console.error('이미지 생성 재시도 모두 실패:', fetchError && (fetchError.stack || fetchError));
         await interaction.editReply(
-          '이미지 생성 서버(Pollinations.ai)가 응답이 너무 늦어서 취소했어요. 무료 서버라 가끔 이런 일이 있어요 — 잠시 후 다시 시도해주세요.',
+          '이미지 생성 서버(Pollinations.ai)가 계속 응답하지 않아요. 무료 서버라 가끔 이런 일이 있어요 — 잠시 후 다시 시도해주세요.',
         );
         return;
       }
       if (!response.ok) {
         if (response.status === 429) {
           await interaction.editReply(
-            '지금 이미지 생성 서버(Pollinations.ai)에 요청이 몰려서 응답이 없어요 (HTTP 429). ' +
+            '지금 이미지 생성 서버(Pollinations.ai)에 요청이 몰려서 계속 실패해요 (HTTP 429). ' +
               '무료 서버라 가끔 이런 일이 있어요 — 1~2분 후에 다시 시도해주세요.',
           );
-          return;
+        } else if (response.status >= 500) {
+          await interaction.editReply(
+            `이미지 생성 서버(Pollinations.ai)에 일시적인 오류가 있어요 (HTTP ${response.status}). 잠시 후 다시 시도해주세요.`,
+          );
+        } else {
+          await interaction.editReply(
+            `이미지를 생성할 수 없었어요 (HTTP ${response.status}). 프롬프트 내용을 바꿔서 다시 시도해보세요.`,
+          );
         }
-        throw new Error(`이미지 서버 응답 오류 (HTTP ${response.status})`);
+        return;
       }
       const buffer = Buffer.from(await response.arrayBuffer());
       const attachment = new AttachmentBuilder(buffer, { name: 'image.png' });
