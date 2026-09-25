@@ -104,6 +104,38 @@ const guildSettings = new Map();
 // 채널별로 가장 최근에 만든 투표 메시지 ID를 기억합니다 (/투표종료에서 사용).
 const activePolls = new Map();
 
+// ===== 운세(별자리) 계산용 =====
+const ZODIAC_RANGES = [
+  { sign: 'capricorn', label: '염소자리', from: [12, 22], to: [1, 19] },
+  { sign: 'aquarius', label: '물병자리', from: [1, 20], to: [2, 18] },
+  { sign: 'pisces', label: '물고기자리', from: [2, 19], to: [3, 20] },
+  { sign: 'aries', label: '양자리', from: [3, 21], to: [4, 19] },
+  { sign: 'taurus', label: '황소자리', from: [4, 20], to: [5, 20] },
+  { sign: 'gemini', label: '쌍둥이자리', from: [5, 21], to: [6, 21] },
+  { sign: 'cancer', label: '게자리', from: [6, 22], to: [7, 22] },
+  { sign: 'leo', label: '사자자리', from: [7, 23], to: [8, 22] },
+  { sign: 'virgo', label: '처녀자리', from: [8, 23], to: [9, 22] },
+  { sign: 'libra', label: '천칭자리', from: [9, 23], to: [10, 23] },
+  { sign: 'scorpio', label: '전갈자리', from: [10, 24], to: [11, 22] },
+  { sign: 'sagittarius', label: '사수자리', from: [11, 23], to: [12, 21] },
+];
+
+function zodiacFromDate(month, day) {
+  for (const z of ZODIAC_RANGES) {
+    const [fromMonth, fromDay] = z.from;
+    const [toMonth, toDay] = z.to;
+    if (fromMonth === toMonth) {
+      if (month === fromMonth && day >= fromDay && day <= toDay) return z;
+    } else if (fromMonth > toMonth) {
+      // 연말/연초를 걸치는 경우 (예: 염소자리 12/22 ~ 1/19)
+      if ((month === fromMonth && day >= fromDay) || (month === toMonth && day <= toDay)) return z;
+    } else if ((month === fromMonth && day >= fromDay) || (month === toMonth && day <= toDay) || (month > fromMonth && month < toMonth)) {
+      return z;
+    }
+  }
+  return null;
+}
+
 // ===== 끝말잇기 =====
 // 채널별 게임 상태: { active, lastWord, usedWords: Set }
 const wordChainGames = new Map();
@@ -454,6 +486,12 @@ const commands = [
           { name: 'KT 위즈', value: 'KT' },
         ),
     ),
+  new SlashCommandBuilder()
+    .setName('운세')
+    .setDescription('오늘의 별자리 운세를 보여줍니다')
+    .addIntegerOption((option) => option.setName('월').setDescription('태어난 달 (1~12)').setRequired(true).setMinValue(1).setMaxValue(12))
+    .addIntegerOption((option) => option.setName('일').setDescription('태어난 일 (1~31)').setRequired(true).setMinValue(1).setMaxValue(31)),
+  new SlashCommandBuilder().setName('명언').setDescription('오늘의 명언을 하나 보여줍니다'),
 ].map((command) => command.toJSON());
 
 async function registerCommandsForGuild(guildId) {
@@ -972,6 +1010,62 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } catch (error) {
       console.error('점수판 조회 오류:', error.stack || error);
       await interaction.editReply('경기 정보를 가져오는 중 오류가 발생했어요. 잠시 후 다시 시도해보세요.');
+    }
+    return;
+  }
+
+  // ===== 운세 (누구나 사용 가능) =====
+  if (interaction.commandName === '운세') {
+    await interaction.deferReply();
+    try {
+      const month = interaction.options.getInteger('월');
+      const day = interaction.options.getInteger('일');
+      const zodiac = zodiacFromDate(month, day);
+      if (!zodiac) {
+        await interaction.editReply('날짜가 올바르지 않아요.');
+        return;
+      }
+      const apiKey = process.env.APININJAS_API_KEY;
+      if (!apiKey) {
+        await interaction.editReply('운세 기능을 쓰려면 APININJAS_API_KEY 환경변수가 필요해요.');
+        return;
+      }
+      const response = await fetchWithTimeout(`https://api.api-ninjas.com/v1/horoscope?zodiac=${zodiac.sign}`, {
+        headers: { 'X-Api-Key': apiKey },
+      });
+      if (!response.ok) throw new Error(`운세 API 오류 (HTTP ${response.status})`);
+      const data = await response.json();
+      const horoscopeEn = data && data.horoscope;
+      if (!horoscopeEn) throw new Error('운세 데이터를 받지 못했어요.');
+      const horoscopeKo = await translateText(horoscopeEn, 'ko', 'en');
+
+      const embed = new EmbedBuilder()
+        .setTitle(`✨ 오늘의 운세 — ${zodiac.label} (${month}월 ${day}일생)`)
+        .setDescription(horoscopeKo)
+        .setColor(0x9b59b6);
+      await interaction.editReply({ embeds: [embed] });
+    } catch (error) {
+      console.error('운세 조회 오류:', error.stack || error);
+      await interaction.editReply('운세를 가져오는 중 오류가 발생했어요. 잠시 후 다시 시도해보세요.');
+    }
+    return;
+  }
+
+  // ===== 명언 (누구나 사용 가능) =====
+  if (interaction.commandName === '명언') {
+    await interaction.deferReply();
+    try {
+      const response = await fetchWithTimeout('https://korean-advice-open-api.vercel.app/api/advice');
+      if (!response.ok) throw new Error(`명언 API 오류 (HTTP ${response.status})`);
+      const data = await response.json();
+      const message = data && data.message;
+      const author = (data && data.author) || '작자 미상';
+      if (!message) throw new Error('명언 데이터를 받지 못했어요.');
+      const embed = new EmbedBuilder().setDescription(`💬 "${message}"\n\n— ${author}`).setColor(0xf1c40f);
+      await interaction.editReply({ embeds: [embed] });
+    } catch (error) {
+      console.error('명언 조회 오류:', error.stack || error);
+      await interaction.editReply('명언을 가져오는 중 오류가 발생했어요. 잠시 후 다시 시도해보세요.');
     }
     return;
   }
