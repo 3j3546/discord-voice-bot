@@ -90,6 +90,11 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent, // 끝말잇기 채팅 내용을 읽기 위해 필요
   ],
+  // 디스코드 REST API(deferReply/reply 등)로 나가는 요청이 네트워크 문제로
+  // 응답도 에러도 없이 멈춰버리는(hang) 경우를 대비해, 일정 시간 지나면
+  // 강제로 실패 처리하도록 타임아웃을 짧게 잡습니다. 기본값은 훨씬 길어서
+  // 문제가 생겨도 몇 분씩 조용히 멈춰있을 수 있습니다.
+  rest: { timeout: 10_000 },
 });
 
 // 길드(서버)별 목소리/속도 설정을 저장합니다.
@@ -272,21 +277,45 @@ function voiceLabel(voice) {
   return voice === DEFAULT_VOICE ? '남자 (인준)' : '여자 (선희)';
 }
 
-// MyMemory 무료 번역 API를 이용한 번역 (가입/API 키 불필요).
-// source를 안 주면 한국어 포함 여부로 자동 추정합니다.
-// MYMEMORY_EMAIL 환경변수를 넣으면 하루 한도가 5,000자 → 50,000자로 늘어납니다 (가입/인증 불필요, 그냥 붙이면 됨).
+// DeepL 번역 API를 이용한 번역.
+// DEEPL_API_KEY 환경변수가 필요합니다 (deepl.com에서 무료 가입, 신용카드 불필요,
+// 한 달에 500,000자까지 무료). source를 안 주면 한국어 포함 여부로 자동 추정합니다.
 async function translateText(text, target, source) {
   const hasKorean = /[\u3131-\uD79D]/.test(text);
   const src = source || (hasKorean ? 'ko' : 'en');
   if (src === target) return text;
 
-  const email = process.env.MYMEMORY_EMAIL;
-  const emailParam = email ? `&de=${encodeURIComponent(email)}` : '';
-  const response = await fetchWithTimeout(
-    `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${src}|${target}${emailParam}`,
-  );
+  const apiKey = process.env.DEEPL_API_KEY;
+  if (!apiKey) {
+    throw new Error('번역 기능을 쓰려면 DEEPL_API_KEY 환경변수를 설정해야 해요.');
+  }
+
+  // DeepL은 언어 코드를 대문자로 쓰고, 중국어는 zh-CN이 아니라 ZH로 씁니다.
+  const deeplLang = (code) => (code === 'zh-CN' ? 'ZH' : code.toUpperCase());
+
+  // 무료 키는 뒤에 ":fx"가 붙고, 유료 키는 안 붙습니다. 붙어있는 키를 쓰면
+  // 무료용 엔드포인트(api-free.deepl.com)로, 아니면 유료용(api.deepl.com)으로 보냅니다.
+  const isFreeKey = apiKey.endsWith(':fx');
+  const endpoint = isFreeKey
+    ? 'https://api-free.deepl.com/v2/translate'
+    : 'https://api.deepl.com/v2/translate';
+
+  const response = await fetchWithTimeout(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      Authorization: `DeepL-Auth-Key ${apiKey}`,
+    },
+    body: `text=${encodeURIComponent(text)}&source_lang=${deeplLang(src)}&target_lang=${deeplLang(target)}`,
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text().catch(() => '');
+    throw new Error(`DeepL 번역 API 오류 (HTTP ${response.status}): ${errorBody.slice(0, 200)}`);
+  }
+
   const data = await response.json();
-  const translated = data && data.responseData && data.responseData.translatedText;
+  const translated = data && data.translations && data.translations[0] && data.translations[0].text;
   if (!translated) throw new Error('번역 결과를 받지 못했어요.');
   return translated;
 }
