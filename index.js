@@ -754,12 +754,34 @@ client.on(Events.InteractionCreate, async (interaction) => {
     try {
       // Discord가 URL에서 직접 이미지를 못 가져오는 경우가 있어서,
       // 봇이 이미지를 미리 받아온 뒤 첨부파일로 올립니다.
-      // Pollinations.ai 무료 서버는 요청이 몰리면 일시적으로 429(너무 많은 요청)를
-      // 돌려줄 때가 있어서, 한 번 실패하면 잠깐 쉬었다가 한 번 더 시도합니다.
-      let response = await fetchWithTimeout(imageUrl, {}, 20000);
-      if (response.status === 429) {
+      // Pollinations.ai 무료 서버는 그림을 그리는 데 20초 넘게 걸릴 때도 있고,
+      // 요청이 몰리면 일시적으로 429(너무 많은 요청)를 돌려줄 때도 있어서,
+      // 타임아웃을 넉넉히 주고 한 번 실패하면 자동으로 한 번 더 시도합니다.
+      // (이미 deferReply를 해놔서 최대 15분까지는 여유롭게 기다렸다가 답할 수 있어요.)
+      const IMAGE_TIMEOUT_MS = 45000;
+      let response;
+      let timedOut = false;
+      try {
+        response = await fetchWithTimeout(imageUrl, {}, IMAGE_TIMEOUT_MS);
+      } catch (error) {
+        timedOut = true;
+      }
+
+      if (timedOut || (response && response.status === 429)) {
         await new Promise((resolve) => setTimeout(resolve, 3000));
-        response = await fetchWithTimeout(imageUrl, {}, 20000);
+        try {
+          response = await fetchWithTimeout(imageUrl, {}, IMAGE_TIMEOUT_MS);
+          timedOut = false;
+        } catch (error) {
+          timedOut = true;
+        }
+      }
+
+      if (timedOut) {
+        await interaction.editReply(
+          '이미지 생성 서버(Pollinations.ai)가 응답이 너무 늦어서 취소했어요. 무료 서버라 가끔 이런 일이 있어요 — 잠시 후 다시 시도해주세요.',
+        );
+        return;
       }
       if (!response.ok) {
         if (response.status === 429) {
