@@ -754,8 +754,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
     try {
       // Discord가 URL에서 직접 이미지를 못 가져오는 경우가 있어서,
       // 봇이 이미지를 미리 받아온 뒤 첨부파일로 올립니다.
-      const response = await fetchWithTimeout(imageUrl, {}, 20000);
+      // Pollinations.ai 무료 서버는 요청이 몰리면 일시적으로 429(너무 많은 요청)를
+      // 돌려줄 때가 있어서, 한 번 실패하면 잠깐 쉬었다가 한 번 더 시도합니다.
+      let response = await fetchWithTimeout(imageUrl, {}, 20000);
+      if (response.status === 429) {
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        response = await fetchWithTimeout(imageUrl, {}, 20000);
+      }
       if (!response.ok) {
+        if (response.status === 429) {
+          await interaction.editReply(
+            '지금 이미지 생성 서버(Pollinations.ai)에 요청이 몰려서 응답이 없어요 (HTTP 429). ' +
+              '무료 서버라 가끔 이런 일이 있어요 — 1~2분 후에 다시 시도해주세요.',
+          );
+          return;
+        }
         throw new Error(`이미지 서버 응답 오류 (HTTP ${response.status})`);
       }
       const buffer = Buffer.from(await response.arrayBuffer());
