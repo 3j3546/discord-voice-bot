@@ -48,6 +48,44 @@ const {
 const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
 const sharp = require('sharp');
 const GIFEncoder = require('gif-encoder-2');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+// 룰렛 이미지(SVG→PNG)에 한글 글자가 깨지지 않게, 한글이 포함된 폰트 파일을
+// 프로젝트에 직접 번들(npm "pretendard" 패키지)해서 씁니다. Render 같은 서버는
+// 기본적으로 한글 폰트가 전혀 설치돼 있지 않아서, 시스템 폰트에만 의존하면
+// 글자가 네모 박스나 깨진 모양으로 나옵니다. fontconfig 설정 파일을 직접 만들어서
+// "이 폰트를 쓰라"고 sharp(libvips/librsvg)에게 알려주면 시스템 폰트 설치 여부와
+// 무관하게 항상 똑같이 렌더링됩니다.
+try {
+  const pretendardPkgDir = path.dirname(require.resolve('pretendard/package.json'));
+  const fontPath = path.join(pretendardPkgDir, 'dist', 'public', 'static', 'alternative', 'Pretendard-Bold.ttf');
+
+  if (fs.existsSync(fontPath)) {
+    const confDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fontconfig-'));
+    const cacheDir = path.join(confDir, 'cache');
+    fs.mkdirSync(cacheDir);
+    const confPath = path.join(confDir, 'fonts.conf');
+    const confXml = `<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <dir>${path.dirname(fontPath)}</dir>
+  <cachedir>${cacheDir}</cachedir>
+  <match target="pattern">
+    <test qual="any" name="family"><string>sans-serif</string></test>
+    <edit name="family" mode="prepend" binding="strong"><string>Pretendard</string></edit>
+  </match>
+</fontconfig>`;
+    fs.writeFileSync(confPath, confXml);
+    process.env.FONTCONFIG_FILE = confPath;
+    console.log('🔤 룰렛용 한글 폰트(Pretendard)를 등록했어요.');
+  } else {
+    console.error('⚠️ 번들된 폰트 파일을 찾지 못했어요. 룰렛 글자가 깨질 수 있어요:', fontPath);
+  }
+} catch (error) {
+  console.error('⚠️ 폰트 설정 중 오류(무시하고 계속 진행합니다, 룰렛 글자가 깨질 수 있어요):', error.message);
+}
 
 // 외부 API가 응답을 안 주고 멈춰버리는(행) 경우를 대비해,
 // 일정 시간(기본 8초)이 지나면 강제로 실패 처리하는 fetch 래퍼입니다.
@@ -210,7 +248,7 @@ function buildWheelSvg(items, rotationDeg) {
     const rotation = effectiveAngle > 90 && effectiveAngle <= 270 ? midAngle - 180 : midAngle;
     const fontSize = n > 8 ? 18 : 24;
 
-    labels += `<text x="${lx}" y="${ly}" font-size="${fontSize}" font-weight="bold" fill="#ffffff" text-anchor="middle" dominant-baseline="middle" transform="rotate(${rotation}, ${lx}, ${ly})" style="font-family: sans-serif; paint-order: stroke; stroke: #00000080; stroke-width: 4px;">${escapeXmlText(text)}</text>`;
+    labels += `<text x="${lx}" y="${ly}" font-size="${fontSize}" font-weight="bold" fill="#ffffff" text-anchor="middle" dominant-baseline="middle" transform="rotate(${rotation}, ${lx}, ${ly})" style="font-family: Pretendard, sans-serif; paint-order: stroke; stroke: #00000080; stroke-width: 4px;">${escapeXmlText(text)}</text>`;
   }
 
   return `<svg width="${WHEEL_SIZE}" height="${WHEEL_SIZE}" xmlns="http://www.w3.org/2000/svg">
