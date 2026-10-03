@@ -418,6 +418,22 @@ const commands = [
         .setMaxValue(100),
     ),
   new SlashCommandBuilder()
+    .setName('tts')
+    .setDescription('입력한 내용을 봇이 음성 채널에서 말해줍니다')
+    .addStringOption((option) =>
+      option.setName('내용').setDescription('말할 내용 (최대 200자)').setRequired(true).setMaxLength(200),
+    )
+    .addStringOption((option) =>
+      option
+        .setName('목소리')
+        .setDescription('목소리 (안 고르면 서버 기본 목소리로 말해요)')
+        .setRequired(false)
+        .addChoices(
+          { name: '남자 (인준)', value: 'male' },
+          { name: '여자 (선희)', value: 'female' },
+        ),
+    ),
+  new SlashCommandBuilder()
     .setName('설정확인')
     .setDescription('현재 목소리/속도 설정을 확인합니다'),
   new SlashCommandBuilder()
@@ -589,14 +605,15 @@ async function playNext(guildId) {
   const state = guildAudio.get(guildId);
   if (!state || state.playing || state.queue.length === 0) return;
 
-  const text = state.queue.shift();
+  const item = state.queue.shift();
   state.playing = true;
   const settings = getSettings(guildId);
+  const voice = item.voice || settings.voice; // /tts에서 목소리를 따로 골랐으면 그걸 우선 사용
 
   try {
     const tts = new MsEdgeTTS();
-    await tts.setMetadata(settings.voice, OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
-    const { audioStream } = tts.toStream(text, { rate: rateToString(settings.rate) });
+    await tts.setMetadata(voice, OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
+    const { audioStream } = tts.toStream(item.text, { rate: rateToString(settings.rate) });
     const resource = createAudioResource(audioStream, { inputType: StreamType.WebmOpus });
     state.player.play(resource);
   } catch (error) {
@@ -606,7 +623,7 @@ async function playNext(guildId) {
   }
 }
 
-async function speak(voiceChannel, text) {
+async function speak(voiceChannel, text, voice) {
   const guildId = voiceChannel.guild.id;
 
   cancelScheduledLeave(guildId);
@@ -635,7 +652,7 @@ async function speak(voiceChannel, text) {
 
   const state = getGuildAudio(guildId);
   connection.subscribe(state.player);
-  state.queue.push(text);
+  state.queue.push({ text, voice });
   playNext(guildId);
 }
 
@@ -764,6 +781,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
       content: `현재 목소리: ${voiceLabel(settings.voice)}\n현재 속도: ${rateToString(settings.rate)}`,
       ephemeral: true,
     });
+    return;
+  }
+
+  // ===== TTS (누구나 사용 가능, 음성 채널에 들어가 있어야 함) =====
+  if (interaction.commandName === 'tts') {
+    const voiceChannel = member.voice.channel;
+    if (!voiceChannel) {
+      await interaction.reply({ content: '먼저 음성 채널에 들어가 있어야 해요.', ephemeral: true });
+      return;
+    }
+
+    const text = interaction.options.getString('내용');
+    const voiceChoice = interaction.options.getString('목소리');
+    const voiceOverride = voiceChoice === 'male' ? DEFAULT_VOICE : voiceChoice === 'female' ? 'ko-KR-SunHiNeural' : undefined;
+
+    speak(voiceChannel, text, voiceOverride);
+    await interaction.reply(
+      `🔊 **${interaction.user.displayName ?? interaction.user.username}**: "${text}"` +
+        (voiceChoice ? ` (${voiceChoice === 'male' ? '남자' : '여자'} 목소리)` : ''),
+    );
     return;
   }
 
