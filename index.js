@@ -421,7 +421,7 @@ const commands = [
     .setName('tts')
     .setDescription('입력한 내용을 봇이 음성 채널에서 말해줍니다')
     .addStringOption((option) =>
-      option.setName('내용').setDescription('말할 내용 (최대 200자)').setRequired(true).setMaxLength(200),
+      option.setName('내용').setDescription('말할 내용').setRequired(true),
     )
     .addStringOption((option) =>
       option
