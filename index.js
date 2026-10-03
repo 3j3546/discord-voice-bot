@@ -46,6 +46,8 @@ const {
   StreamType,
 } = require('@discordjs/voice');
 const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
+const sharp = require('sharp');
+const GIFEncoder = require('gif-encoder-2');
 
 // 외부 API가 응답을 안 주고 멈춰버리는(행) 경우를 대비해,
 // 일정 시간(기본 8초)이 지나면 강제로 실패 처리하는 fetch 래퍼입니다.
@@ -159,6 +161,108 @@ function zodiacFromDate(month, day) {
     }
   }
   return null;
+}
+
+// ===== 룰렛 (돌림판) =====
+// wheelofnames.com 같은 비주얼 룰렛을, 돌아가는 GIF 애니메이션으로 직접 그려서 보여줍니다.
+// 외부 API는 필요 없고(단순 무작위 뽑기라서), sharp로 SVG를 PNG 프레임으로 찍어내고
+// gif-encoder-2로 그 프레임들을 하나의 GIF로 합칩니다.
+const WHEEL_COLORS = ['#e74c3c', '#3498db', '#2ecc71', '#f1c40f', '#9b59b6', '#1abc9c', '#e67e22', '#fd79a8'];
+const WHEEL_SIZE = 480;
+const WHEEL_CENTER = WHEEL_SIZE / 2;
+const WHEEL_RADIUS = WHEEL_SIZE / 2 - 10;
+
+function escapeXmlText(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// 각도 기준: 0=오른쪽, 90=아래, 180=왼쪽, 270=위(=포인터가 가리키는 지점). rotationDeg만큼 시계방향으로 돌린 모습을 그립니다.
+function buildWheelSvg(items, rotationDeg) {
+  const n = items.length;
+  const sliceAngle = 360 / n;
+  let slices = '';
+  let labels = '';
+
+  for (let i = 0; i < n; i++) {
+    const startAngle = i * sliceAngle;
+    const endAngle = startAngle + sliceAngle;
+    const startRad = (startAngle * Math.PI) / 180;
+    const endRad = (endAngle * Math.PI) / 180;
+    const x1 = WHEEL_CENTER + WHEEL_RADIUS * Math.cos(startRad);
+    const y1 = WHEEL_CENTER + WHEEL_RADIUS * Math.sin(startRad);
+    const x2 = WHEEL_CENTER + WHEEL_RADIUS * Math.cos(endRad);
+    const y2 = WHEEL_CENTER + WHEEL_RADIUS * Math.sin(endRad);
+    const largeArc = sliceAngle > 180 ? 1 : 0;
+    const color = WHEEL_COLORS[i % WHEEL_COLORS.length];
+
+    slices += `<path d="M${WHEEL_CENTER},${WHEEL_CENTER} L${x1},${y1} A${WHEEL_RADIUS},${WHEEL_RADIUS} 0 ${largeArc} 1 ${x2},${y2} Z" fill="${color}" stroke="#ffffff" stroke-width="2"/>`;
+
+    const midAngle = startAngle + sliceAngle / 2;
+    const midRad = (midAngle * Math.PI) / 180;
+    const labelRadius = WHEEL_RADIUS * 0.62;
+    const lx = WHEEL_CENTER + labelRadius * Math.cos(midRad);
+    const ly = WHEEL_CENTER + labelRadius * Math.sin(midRad);
+    const text = items[i].length > 10 ? items[i].slice(0, 9) + '…' : items[i];
+    // 글자가 거꾸로 보이지 않도록 180도 뒤집을지 결정합니다. 텍스트가 바깥쪽 <g>의
+    // rotationDeg(휠 전체 회전)까지 같이 적용된 "화면에 실제로 보이는 각도" 기준으로
+    // 판단해야, 휠이 돌아가다가 멈췄을 때도(당첨 칸이 맨 위로 왔을 때도) 글씨가 똑바로 보입니다.
+    const effectiveAngle = ((midAngle + rotationDeg) % 360 + 360) % 360;
+    const rotation = effectiveAngle > 90 && effectiveAngle <= 270 ? midAngle - 180 : midAngle;
+    const fontSize = n > 8 ? 18 : 24;
+
+    labels += `<text x="${lx}" y="${ly}" font-size="${fontSize}" font-weight="bold" fill="#ffffff" text-anchor="middle" dominant-baseline="middle" transform="rotate(${rotation}, ${lx}, ${ly})" style="font-family: sans-serif; paint-order: stroke; stroke: #00000080; stroke-width: 4px;">${escapeXmlText(text)}</text>`;
+  }
+
+  return `<svg width="${WHEEL_SIZE}" height="${WHEEL_SIZE}" xmlns="http://www.w3.org/2000/svg">
+    <g transform="rotate(${rotationDeg}, ${WHEEL_CENTER}, ${WHEEL_CENTER})">
+      ${slices}
+      ${labels}
+    </g>
+    <circle cx="${WHEEL_CENTER}" cy="${WHEEL_CENTER}" r="16" fill="#2c3e50" stroke="#ffffff" stroke-width="3"/>
+    <polygon points="${WHEEL_CENTER - 16},8 ${WHEEL_CENTER + 16},8 ${WHEEL_CENTER},36" fill="#2c3e50" stroke="#ffffff" stroke-width="2"/>
+  </svg>`;
+}
+
+function easeOutCubic(t) {
+  return 1 - Math.pow(1 - t, 3);
+}
+
+async function svgToRgbaFrame(svg) {
+  const png = await sharp(Buffer.from(svg)).png().toBuffer();
+  const { data } = await sharp(png).raw().ensureAlpha().toBuffer({ resolveWithObject: true });
+  return data;
+}
+
+// 룰렛이 winnerIndex 항목에서 멈추는 스핀 애니메이션 GIF를 만들어서 Buffer로 반환합니다.
+async function createRouletteGif(items, winnerIndex) {
+  const n = items.length;
+  const sliceAngle = 360 / n;
+  const winnerSliceCenter = winnerIndex * sliceAngle + sliceAngle / 2;
+  // 당첨 칸 안에서 살짝 무작위로 위치를 어긋나게 해서 매번 똑같은 곳에 안 멈추게 합니다.
+  const jitter = (Math.random() - 0.5) * (sliceAngle * 0.7);
+  const extraSpins = 5 * 360;
+  const finalRotation = extraSpins + (270 - winnerSliceCenter) - jitter;
+
+  const totalFrames = 30;
+  const encoder = new GIFEncoder(WHEEL_SIZE, WHEEL_SIZE);
+  encoder.start();
+  encoder.setRepeat(0);
+  encoder.setDelay(55);
+  encoder.setQuality(10);
+
+  for (let f = 0; f <= totalFrames; f++) {
+    const t = f / totalFrames;
+    const rotation = finalRotation * easeOutCubic(t);
+    const frame = await svgToRgbaFrame(buildWheelSvg(items, rotation));
+    encoder.addFrame(frame);
+  }
+  // 멈춘 모습을 좀 더 오래 보여주기 위해 마지막 프레임을 길게 한 번 더 넣습니다.
+  const finalFrame = await svgToRgbaFrame(buildWheelSvg(items, finalRotation));
+  encoder.setDelay(2000);
+  encoder.addFrame(finalFrame);
+
+  encoder.finish();
+  return encoder.out.getData();
 }
 
 // ===== 끝말잇기 =====
@@ -469,6 +573,15 @@ const commands = [
   new SlashCommandBuilder()
     .setName('투표종료')
     .setDescription('이 채널의 가장 최근 투표를 마감하고 결과를 보여줍니다'),
+  new SlashCommandBuilder()
+    .setName('룰렛')
+    .setDescription('돌아가는 룰렛으로 항목 중 하나를 무작위로 뽑습니다')
+    .addStringOption((option) =>
+      option
+        .setName('항목')
+        .setDescription('쉼표(,)로 구분해서 입력 (예: 피자,치킨,족발) — 2개 이상 10개 이하')
+        .setRequired(true),
+    ),
   new SlashCommandBuilder()
     .setName('끝말잇기시작')
     .setDescription('이 채널에서 끝말잇기를 시작합니다'),
@@ -931,6 +1044,44 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } catch (error) {
       console.error('투표 마감 오류:', error.message);
       await interaction.editReply('투표 결과를 집계하는 중 오류가 발생했어요.');
+    }
+    return;
+  }
+
+  // ===== 룰렛 (누구나 사용 가능) =====
+  if (interaction.commandName === '룰렛') {
+    const rawItems = interaction.options.getString('항목');
+    const items = rawItems
+      .split(',')
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+
+    if (items.length < 2) {
+      await interaction.reply({ content: '항목을 쉼표(,)로 구분해서 2개 이상 입력해주세요. 예: `피자,치킨,족발`', ephemeral: true });
+      return;
+    }
+    if (items.length > 10) {
+      await interaction.reply({ content: '항목은 최대 10개까지만 가능해요.', ephemeral: true });
+      return;
+    }
+
+    await interaction.deferReply();
+
+    try {
+      const winnerIndex = Math.floor(Math.random() * items.length);
+      const gifBuffer = await createRouletteGif(items, winnerIndex);
+      const attachment = new AttachmentBuilder(gifBuffer, { name: 'roulette.gif' });
+
+      const embed = new EmbedBuilder()
+        .setTitle('🎡 룰렛')
+        .setDescription(`항목: ${items.join(', ')}\n\n🎉 당첨: **${items[winnerIndex]}**`)
+        .setImage('attachment://roulette.gif')
+        .setColor(0xf368e0);
+
+      await interaction.editReply({ embeds: [embed], files: [attachment] });
+    } catch (error) {
+      console.error('룰렛 생성 오류:', error.stack || error);
+      await interaction.editReply('룰렛을 돌리는 중 오류가 발생했어요. 잠시 후 다시 시도해보세요.');
     }
     return;
   }
