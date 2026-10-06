@@ -108,12 +108,12 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
 // 이미지 생성 서버(Pollinations.ai)는 무료라 타임아웃/429(요청 폭주)/5xx(서버 오류)가
 // 종종 생깁니다. 재시도할 가치가 있는 실패(타임아웃, 429, 5xx)일 때만 간격을 두고
 // 최대 3번까지 다시 시도하고, 그 외(4xx 등)는 바로 결과를 돌려줍니다.
-async function fetchImageWithRetries(url, maxAttempts = 3) {
+async function fetchImageWithRetries(url, maxAttempts = 3, timeoutMs = 45000) {
   let lastError = null;
   let lastResponse = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const response = await fetchWithTimeout(url, {}, 45000);
+      const response = await fetchWithTimeout(url, {}, timeoutMs);
       if (response.ok) return { response };
       lastResponse = response;
       if (response.status !== 429 && response.status < 500) {
@@ -128,6 +128,44 @@ async function fetchImageWithRetries(url, maxAttempts = 3) {
     }
   }
   return { response: lastResponse, error: lastError };
+}
+
+// ===== 삼행시 =====
+// 무료 텍스트 AI(Pollinations, API 키 불필요)에게 제시어의 글자마다 한 줄씩 짓게 합니다.
+// 각 줄이 정확히 그 글자로 시작하는지 검사하고, 아니면 한 번 더 시도합니다.
+function parseAcrostic(text, chars) {
+  const lines = String(text)
+    .split('\n')
+    .map((line) =>
+      line
+        .replace(/^[\s\-*•\d.)]+/, '')
+        .replace(/^[^가-힣]{0,3}(?=[가-힣])/, '')
+        .replace(/^[가-힣]\s*[:：]\s*/, '') // "디: 디자인이" 같은 라벨 표기는 라벨만 제거
+        .trim(),
+    )
+    .filter((line) => line.length > 0);
+  if (lines.length < chars.length) return null;
+  const picked = lines.slice(0, chars.length);
+  return picked.every((line, i) => line.startsWith(chars[i])) ? picked : null;
+}
+
+async function makeAcrostic(word) {
+  const chars = [...word];
+  const prompt =
+    `제시어 "${word}"로 한국어 ${chars.length}행시를 지어줘. ` +
+    `각 줄은 순서대로 ${chars.map((c) => `"${c}"`).join(', ')}(으)로 시작해야 하고, ` +
+    `재치 있고 짧은 한 문장씩, 총 ${chars.length}줄만 출력해. 설명이나 제목, 번호는 쓰지 마.`;
+  const url = `https://text.pollinations.ai/${encodeURIComponent(prompt)}?model=openai&seed=${Math.floor(Math.random() * 100000)}`;
+
+  let lastText = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const { response } = await fetchImageWithRetries(url + `&n=${attempt}`, 2, 25000);
+    if (!response || !response.ok) continue;
+    lastText = await response.text();
+    const parsed = parseAcrostic(lastText, chars);
+    if (parsed) return parsed;
+  }
+  return null;
 }
 
 // ===== 기본 음성 설정 (/목소리, /속도 명령어로 서버별로 바꿀 수 있습니다) =====
@@ -684,6 +722,17 @@ const commands = [
     .addIntegerOption((option) => option.setName('월').setDescription('태어난 달 (1~12)').setRequired(true).setMinValue(1).setMaxValue(12))
     .addIntegerOption((option) => option.setName('일').setDescription('태어난 일 (1~31)').setRequired(true).setMinValue(1).setMaxValue(31)),
   new SlashCommandBuilder().setName('명언').setDescription('오늘의 명언을 하나 보여줍니다'),
+  new SlashCommandBuilder()
+    .setName('삼행시')
+    .setDescription('제시어로 AI가 N행시를 지어줍니다')
+    .addStringOption((option) =>
+      option
+        .setName('제시어')
+        .setDescription('한글 2~5글자 (예: 디스코드)')
+        .setRequired(true)
+        .setMinLength(2)
+        .setMaxLength(5),
+    ),
 ].map((command) => command.toJSON());
 
 async function registerCommandsForGuild(guildId) {
@@ -1343,6 +1392,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } catch (error) {
       console.error('명언 조회 오류:', error.stack || error);
       await interaction.editReply('명언을 가져오는 중 오류가 발생했어요. 잠시 후 다시 시도해보세요.');
+    }
+    return;
+  }
+
+  // ===== 삼행시 (누구나 사용 가능) =====
+  if (interaction.commandName === '삼행시') {
+    const word = interaction.options.getString('제시어').trim();
+    if (!/^[가-힣]{2,5}$/.test(word)) {
+      await interaction.reply({ content: '제시어는 한글 2~5글자만 가능해요. 예: `디스코드`', ephemeral: true });
+      return;
+    }
+    await interaction.deferReply();
+    try {
+      const lines = await makeAcrostic(word);
+      if (!lines) {
+        await interaction.editReply('삼행시 서버(Pollinations)가 응답하지 않거나 형식이 안 맞았어요. 무료 서버라 가끔 이래요 — 잠시 후 다시 시도해주세요.');
+        return;
+      }
+      const body = lines.map((line, i) => `**${[...word][i]}**${line.slice(1)}`).join('\n');
+      const embed = new EmbedBuilder().setTitle(`✍️ ${word} ${lines.length}행시`).setDescription(body).setColor(0x9b59b6);
+      await interaction.editReply({ embeds: [embed] });
+    } catch (error) {
+      console.error('삼행시 생성 오류:', error.stack || error);
+      await interaction.editReply('삼행시를 짓는 중 오류가 발생했어요. 잠시 후 다시 시도해보세요.');
     }
     return;
   }
