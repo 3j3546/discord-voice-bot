@@ -29,6 +29,7 @@ const {
   Routes,
   SlashCommandBuilder,
   PermissionFlagsBits,
+  ChannelType,
   EmbedBuilder,
   AttachmentBuilder,
   ActionRowBuilder,
@@ -551,7 +552,7 @@ async function checkWordChain(game, word) {
 
 function getSettings(guildId) {
   if (!guildSettings.has(guildId)) {
-    guildSettings.set(guildId, { voice: DEFAULT_VOICE, rate: DEFAULT_RATE });
+    guildSettings.set(guildId, { voice: DEFAULT_VOICE, rate: DEFAULT_RATE, logChannelId: null });
   }
   return guildSettings.get(guildId);
 }
@@ -663,6 +664,19 @@ const commands = [
           { name: '여자 (선희)', value: 'female' },
         ),
     ),
+  new SlashCommandBuilder()
+    .setName('알림채널')
+    .setDescription('입퇴장 글자 알림을 올릴 텍스트 채널을 지정합니다 (서버 관리 권한 필요)')
+    .addChannelOption((option) =>
+      option
+        .setName('채널')
+        .setDescription('알림을 올릴 텍스트 채널')
+        .setRequired(true)
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
+    ),
+  new SlashCommandBuilder()
+    .setName('알림채널해제')
+    .setDescription('지정한 알림 채널을 해제합니다 (다시 각 음성채널 채팅에 올라갑니다)'),
   new SlashCommandBuilder()
     .setName('설정확인')
     .setDescription('현재 목소리/속도 설정을 확인합니다'),
@@ -996,7 +1010,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   const guildId = interaction.guildId;
 
   // ===== 설정 명령어 (서버 관리 권한 필요) =====
-  if (interaction.commandName === '목소리' || interaction.commandName === '속도') {
+  if (['목소리', '속도', '알림채널', '알림채널해제'].includes(interaction.commandName)) {
     if (!member.permissions.has(PermissionFlagsBits.ManageGuild)) {
       await interaction.reply({
         content: '이 명령어는 "서버 관리" 권한이 있는 사람만 사용할 수 있어요.',
@@ -1007,7 +1021,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     const settings = getSettings(guildId);
 
-    if (interaction.commandName === '목소리') {
+    if (interaction.commandName === '알림채널') {
+      const channel = interaction.options.getChannel('채널');
+      const me = interaction.guild.members.me;
+      const perms = me && channel.permissionsFor(me);
+      if (!perms || !perms.has(PermissionFlagsBits.ViewChannel) || !perms.has(PermissionFlagsBits.SendMessages)) {
+        await interaction.reply({
+          content: `봇이 <#${channel.id}> 채널에서 글을 쓸 수 없어요. 그 채널에서 봇 역할에 "채널 보기"와 "메시지 보내기" 권한을 준 뒤 다시 시도해주세요.`,
+          ephemeral: true,
+        });
+        return;
+      }
+      settings.logChannelId = channel.id;
+      await interaction.reply({
+        content: `입퇴장 글자 알림을 <#${channel.id}> 채널에 올리도록 설정했어요.\n(봇이 재시작되면 해제되고 각 음성채널 채팅으로 돌아가요.)`,
+        ephemeral: true,
+      });
+    } else if (interaction.commandName === '알림채널해제') {
+      settings.logChannelId = null;
+      await interaction.reply({
+        content: '알림 채널 지정을 해제했어요. 이제 각 음성채널의 채팅에 글자 알림이 올라가요.',
+        ephemeral: true,
+      });
+    } else if (interaction.commandName === '목소리') {
       const choice = interaction.options.getString('설정');
       settings.voice = choice === 'male' ? DEFAULT_VOICE : 'ko-KR-SunHiNeural';
       await interaction.reply({
@@ -1028,7 +1064,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.commandName === '설정확인') {
     const settings = getSettings(guildId);
     await interaction.reply({
-      content: `현재 목소리: ${voiceLabel(settings.voice)}\n현재 속도: ${rateToString(settings.rate)}`,
+      content: `현재 목소리: ${voiceLabel(settings.voice)}\n현재 속도: ${rateToString(settings.rate)}\n입퇴장 글자 알림: ${settings.logChannelId ? `<#${settings.logChannelId}>` : '각 음성채널 채팅'}`,
       ephemeral: true,
     });
     return;
@@ -1527,6 +1563,30 @@ client.on(Events.MessageCreate, async (message) => {
   }
 });
 
+// 입퇴장 안내를 음성으로 말하는 것과 함께, 그 음성채널의 채팅(음성채널 안의 텍스트 채팅)에도
+// 글자로 남깁니다. 봇에게 그 채널의 "메시지 보내기" 권한이 없으면 글자 알림만 조용히 건너뛰고
+// (로그만 남김) 음성 안내는 그대로 동작합니다.
+async function postVoiceLog(voiceChannel, text) {
+  let channel = voiceChannel;
+  try {
+    const logChannelId = voiceChannel && getSettings(voiceChannel.guild.id).logChannelId;
+    if (logChannelId) {
+      channel = voiceChannel.guild.channels.cache.get(logChannelId) || (await voiceChannel.guild.channels.fetch(logChannelId));
+    }
+  } catch (error) {
+    console.error('지정된 알림 채널을 찾지 못해 음성채널 채팅으로 대신 보냅니다:', error.message);
+    channel = voiceChannel;
+  }
+  try {
+    if (!channel || typeof channel.send !== 'function') return;
+    // 별도 알림 채널로 보낼 땐 어느 음성채널 이야기인지 알 수 있게 채널 이름을 덧붙입니다.
+    const suffix = channel !== voiceChannel && voiceChannel ? ` — 🔊 ${voiceChannel.name}` : '';
+    await channel.send({ content: text + suffix, allowedMentions: { parse: [] } });
+  } catch (error) {
+    console.error(`입퇴장 글자 알림 전송 실패 (#${channel && channel.name}):`, error.message);
+  }
+}
+
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   const member = newState.member ?? oldState.member;
   if (!member || member.user.bot) return; // 봇 자신의 입퇴장은 무시
@@ -1536,12 +1596,14 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   // 새로운 음성채널 입장
   if (!oldState.channelId && newState.channelId) {
     speak(newState.channel, `${nickname}님이 입장했습니다`);
+    postVoiceLog(newState.channel, `🟢 **${nickname}**님이 입장했습니다`);
     return;
   }
 
   // 음성채널에서 완전히 퇴장
   if (oldState.channelId && !newState.channelId) {
     speak(oldState.channel, `${nickname}님이 퇴장했습니다`);
+    postVoiceLog(oldState.channel, `🔴 **${nickname}**님이 퇴장했습니다`);
     return;
   }
 
@@ -1549,6 +1611,8 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
     speak(oldState.channel, `${nickname}님이 채널을 이동했습니다`);
     speak(newState.channel, `${nickname}님이 입장했습니다`);
+    postVoiceLog(oldState.channel, `🔀 **${nickname}**님이 **${newState.channel.name}** 채널로 이동했습니다`);
+    postVoiceLog(newState.channel, `🟢 **${nickname}**님이 입장했습니다 (**${oldState.channel.name}**에서 이동)`);
   }
 });
 
