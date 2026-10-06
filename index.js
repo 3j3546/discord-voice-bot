@@ -155,17 +155,67 @@ async function makeAcrostic(word) {
     `제시어 "${word}"로 한국어 ${chars.length}행시를 지어줘. ` +
     `각 줄은 순서대로 ${chars.map((c) => `"${c}"`).join(', ')}(으)로 시작해야 하고, ` +
     `재치 있고 짧은 한 문장씩, 총 ${chars.length}줄만 출력해. 설명이나 제목, 번호는 쓰지 마.`;
-  const url = `https://text.pollinations.ai/${encodeURIComponent(prompt)}?model=openai&seed=${Math.floor(Math.random() * 100000)}`;
 
-  let lastText = null;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const { response } = await fetchImageWithRetries(url + `&n=${attempt}`, 2, 25000);
-    if (!response || !response.ok) continue;
-    lastText = await response.text();
-    const parsed = parseAcrostic(lastText, chars);
-    if (parsed) return parsed;
+  // 서로 다른 두 가지 주소를 번갈아 시도합니다 (한쪽이 막히거나 바뀌어도 다른 쪽으로 동작하게).
+  const attempts = [
+    async () => {
+      const url = `https://text.pollinations.ai/${encodeURIComponent(prompt)}?model=openai&seed=${Math.floor(Math.random() * 100000)}`;
+      const { response, error } = await fetchImageWithRetries(url, 1, 25000);
+      return { response, error };
+    },
+    async () => {
+      const response = await fetchWithTimeout(
+        'https://text.pollinations.ai/openai',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'openai',
+            seed: Math.floor(Math.random() * 100000),
+            messages: [{ role: 'user', content: prompt }],
+          }),
+        },
+        25000,
+      );
+      return { response, isChat: true };
+    },
+  ];
+
+  let fallbackLines = null;
+  for (let round = 0; round < 2; round++) {
+    for (let i = 0; i < attempts.length; i++) {
+      try {
+        const { response, error, isChat } = await attempts[i]();
+        if (!response) {
+          console.error(`삼행시 시도 실패 (방식 ${i + 1}):`, error && error.message);
+          continue;
+        }
+        if (!response.ok) {
+          const body = (await response.text().catch(() => '')).slice(0, 200);
+          console.error(`삼행시 시도 실패 (방식 ${i + 1}): HTTP ${response.status} ${body}`);
+          continue;
+        }
+        let text = await response.text();
+        if (isChat) {
+          try {
+            text = JSON.parse(text).choices[0].message.content;
+          } catch (e) {
+            console.error('삼행시 응답 JSON 해석 실패:', text.slice(0, 200));
+            continue;
+          }
+        }
+        const parsed = parseAcrostic(text, chars);
+        if (parsed) return { lines: parsed, exact: true };
+        console.error(`삼행시 형식 불일치 (방식 ${i + 1}) 응답:`, text.slice(0, 200));
+        // 글자가 정확히 안 맞아도 줄 수만 맞으면 최후의 수단으로 보여줄 수 있게 보관
+        const loose = text.split('\n').map((l) => l.trim()).filter(Boolean);
+        if (loose.length >= chars.length && !fallbackLines) fallbackLines = loose.slice(0, chars.length);
+      } catch (error) {
+        console.error(`삼행시 시도 오류 (방식 ${i + 1}):`, error.message);
+      }
+    }
   }
-  return null;
+  return fallbackLines ? { lines: fallbackLines, exact: false } : null;
 }
 
 // ===== 기본 음성 설정 (/목소리, /속도 명령어로 서버별로 바꿀 수 있습니다) =====
@@ -1405,12 +1455,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     await interaction.deferReply();
     try {
-      const lines = await makeAcrostic(word);
-      if (!lines) {
-        await interaction.editReply('삼행시 서버(Pollinations)가 응답하지 않거나 형식이 안 맞았어요. 무료 서버라 가끔 이래요 — 잠시 후 다시 시도해주세요.');
+      const result = await makeAcrostic(word);
+      if (!result) {
+        await interaction.editReply('삼행시 서버(Pollinations)가 응답하지 않아요. 무료 서버라 가끔 이래요 — 잠시 후 다시 시도해주세요.');
         return;
       }
-      const body = lines.map((line, i) => `**${[...word][i]}**${line.slice(1)}`).join('\n');
+      const lines = result.lines;
+      const body = result.exact
+        ? lines.map((line, i) => `**${[...word][i]}**${line.slice(1)}`).join('\n')
+        : lines.join('\n');
       const embed = new EmbedBuilder().setTitle(`✍️ ${word} ${lines.length}행시`).setDescription(body).setColor(0x9b59b6);
       await interaction.editReply({ embeds: [embed] });
     } catch (error) {
