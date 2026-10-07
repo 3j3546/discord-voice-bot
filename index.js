@@ -1955,7 +1955,32 @@ if (!process.env.DISCORD_TOKEN) {
 } else {
   console.log('🔌 디스코드에 로그인을 시도합니다...');
 
+  // 디스코드 쪽에서 요청 제한(rate limit)에 걸렸다면 그 사실이 로그에 남도록 합니다.
+  client.rest.on('rateLimited', (info) => {
+    console.error('⏳ 디스코드 요청 제한(rate limit)에 걸렸어요:', JSON.stringify(info));
+  });
+
+  // 멈춤의 원인을 알 수 있게, 경고 시점에 디스코드 API에 직접 접속해보고 결과를 남깁니다.
+  // (로그인 때 봇이 실제로 호출하는 주소와 같아요. 토큰 값 자체는 로그에 찍지 않습니다.)
+  async function probeDiscord() {
+    for (const [label, url, headers] of [
+      ['일반 접속', 'https://discord.com/api/v10/gateway', {}],
+      ['봇 토큰 접속', 'https://discord.com/api/v10/gateway/bot', { Authorization: `Bot ${process.env.DISCORD_TOKEN}` }],
+    ]) {
+      try {
+        const r = await fetchWithTimeout(url, { headers }, 10000);
+        const body = (await r.text()).replace(/\s+/g, ' ').slice(0, 160);
+        console.error(
+          `🔎 [${label}] HTTP ${r.status} / retry-after=${r.headers.get('retry-after')} / cf-ray=${r.headers.get('cf-ray')} / 본문: ${body}`,
+        );
+      } catch (error) {
+        console.error(`🔎 [${label}] 접속 실패 (연결 자체가 안 됨): ${error.message}`);
+      }
+    }
+  }
+
   const loginWatchdog = setTimeout(() => {
+    probeDiscord().catch(() => {});
     console.error(
       '⚠️ 로그인을 시도한 지 20초가 지났는데도 완료되지 않았어요. ' +
         'DISCORD_TOKEN 값이 잘못됐거나(디스코드 개발자 포털에서 토큰을 재발급했다면 Render 쪽 값도 바꿔야 함), ' +
