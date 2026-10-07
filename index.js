@@ -1962,6 +1962,8 @@ if (!process.env.DISCORD_TOKEN) {
 
   // 멈춤의 원인을 알 수 있게, 경고 시점에 디스코드 API에 직접 접속해보고 결과를 남깁니다.
   // (로그인 때 봇이 실제로 호출하는 주소와 같아요. 토큰 값 자체는 로그에 찍지 않습니다.)
+  let discordBlockedUntil = 0; // 디스코드가 이 서버 IP를 막아둔 것으로 확인된 경우, 풀릴 예상 시각
+
   async function probeDiscord() {
     for (const [label, url, headers] of [
       ['일반 접속', 'https://discord.com/api/v10/gateway', {}],
@@ -1969,6 +1971,10 @@ if (!process.env.DISCORD_TOKEN) {
     ]) {
       try {
         const r = await fetchWithTimeout(url, { headers }, 10000);
+        if (r.status === 429) {
+          const waitSec = Number(r.headers.get('retry-after'));
+          if (waitSec > 0) discordBlockedUntil = Math.max(discordBlockedUntil, Date.now() + waitSec * 1000);
+        }
         const body = (await r.text()).replace(/\s+/g, ' ').slice(0, 160);
         console.error(
           `🔎 [${label}] HTTP ${r.status} / retry-after=${r.headers.get('retry-after')} / cf-ray=${r.headers.get('cf-ray')} / 본문: ${body}`,
@@ -1991,12 +1997,32 @@ if (!process.env.DISCORD_TOKEN) {
   // 20초 경고 이후에도 로그인(ClientReady)이 끝나지 않으면, 시작 단계에서 연결이 멈춰버린 것입니다.
   // 이때는 스스로 종료해서 Render가 서비스를 새로 켜게(=새 연결로 다시 시도하게) 합니다.
   // 토큰이 틀린 경우는 멈추지 않고 "로그인 실패" 에러가 바로 나므로 여기에 해당하지 않습니다.
-  const startupHangKiller = setTimeout(() => {
-    if (!client.isReady()) {
-      console.error('❌ 로그인이 90초가 지나도 끝나지 않아서, 봇을 종료하고 Render가 다시 켜도록 합니다.');
-      process.exit(1);
+  function startupCheck() {
+    if (client.isReady()) return;
+    if (discordBlockedUntil > Date.now()) {
+      // 디스코드가 이 서버의 IP를 막아둔 상태(HTTP 429): 다시 켜봐야 또 막히고, 계속 두드리면 더 길어질 수 있어서
+      // 재시작하지 않고 기다립니다. 30분마다 한 번만 가볍게 확인해서 풀렸으면 깨끗하게 다시 시작합니다.
+      const hours = ((discordBlockedUntil - Date.now()) / 3600000).toFixed(1);
+      console.error(`⛔ 디스코드가 이 서버(Render)의 접속을 약 ${hours}시간 동안 막고 있어요 (HTTP 429). 재시작 없이 기다립니다.`);
+      setTimeout(async () => {
+        if (client.isReady()) return;
+        try {
+          const r = await fetchWithTimeout('https://discord.com/api/v10/gateway', {}, 10000);
+          if (r.status !== 429) {
+            console.error('✅ 디스코드 차단이 풀린 것 같아요. 봇을 다시 시작합니다.');
+            process.exit(1);
+          }
+        } catch (error) {
+          console.error('차단 해제 확인 중 오류:', error.message);
+        }
+        startupCheck();
+      }, 30 * 60 * 1000);
+      return;
     }
-  }, 90000);
+    console.error('❌ 로그인이 90초가 지나도 끝나지 않아서, 봇을 종료하고 Render가 다시 켜도록 합니다.');
+    process.exit(1);
+  }
+  const startupHangKiller = setTimeout(startupCheck, 90000);
   client.once(Events.ClientReady, () => clearTimeout(startupHangKiller));
 
   client
