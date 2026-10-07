@@ -1963,11 +1963,23 @@ if (!process.env.DISCORD_TOKEN) {
     );
   }, 20000);
 
+  // 20초 경고 이후에도 로그인(ClientReady)이 끝나지 않으면, 시작 단계에서 연결이 멈춰버린 것입니다.
+  // 이때는 스스로 종료해서 Render가 서비스를 새로 켜게(=새 연결로 다시 시도하게) 합니다.
+  // 토큰이 틀린 경우는 멈추지 않고 "로그인 실패" 에러가 바로 나므로 여기에 해당하지 않습니다.
+  const startupHangKiller = setTimeout(() => {
+    if (!client.isReady()) {
+      console.error('❌ 로그인이 90초가 지나도 끝나지 않아서, 봇을 종료하고 Render가 다시 켜도록 합니다.');
+      process.exit(1);
+    }
+  }, 90000);
+  client.once(Events.ClientReady, () => clearTimeout(startupHangKiller));
+
   client
     .login(process.env.DISCORD_TOKEN)
     .then(() => clearTimeout(loginWatchdog))
     .catch((error) => {
       clearTimeout(loginWatchdog);
+      clearTimeout(startupHangKiller); // 에러로 실패한 건 "멈춤"이 아니므로 자동 종료 대상에서 뺍니다
       console.error('❌ 로그인 실패:', error.stack || error);
     });
 }
