@@ -50,6 +50,7 @@ const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
 const sharp = require('sharp');
 const GIFEncoder = require('gif-encoder-2');
 const fs = require('fs');
+const crypto = require('crypto');
 const os = require('os');
 const path = require('path');
 
@@ -557,6 +558,203 @@ function getSettings(guildId) {
   return guildSettings.get(guildId);
 }
 
+// ===== DB (Upstash Redis, REST 방식) =====
+// 서버별 설정(목소리/속도/알림 채널), 생일, 리마인더를 저장합니다. 몽고DB와 달리 별도 패키지 없이
+// 그냥 HTTPS 요청(fetch)만 쓰고, 환경변수 2개(UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN)만 있으면 됩니다.
+// 환경변수가 없으면 DB 기능만 꺼지고(설정은 메모리 저장으로 동작), 봇의 나머지 기능은 전부 그대로 동작합니다.
+const UPSTASH_URL = (process.env.UPSTASH_REDIS_REST_URL || '').trim().replace(/\/+$/, '');
+const UPSTASH_TOKEN = (process.env.UPSTASH_REDIS_REST_TOKEN || '').trim();
+const dbEnabled = Boolean(UPSTASH_URL && UPSTASH_TOKEN);
+
+async function redis(...command) {
+  if (!dbEnabled) throw new Error('DB가 설정되지 않았어요.');
+  const response = await fetchWithTimeout(
+    UPSTASH_URL,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(command.map(String)),
+    },
+    8000,
+  );
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.error) {
+    throw new Error(`Redis 오류: ${data.error || `HTTP ${response.status}`}`);
+  }
+  return data.result;
+}
+
+// HGETALL 결과(배열 [필드, 값, 필드, 값...] 또는 객체)를 객체로 통일합니다.
+function hashToObject(result) {
+  if (!result) return {};
+  if (!Array.isArray(result)) return result;
+  const obj = {};
+  for (let i = 0; i + 1 < result.length; i += 2) obj[result[i]] = result[i + 1];
+  return obj;
+}
+
+const PERSISTED_SETTING_KEYS = ['voice', 'rate', 'logChannelId'];
+
+async function saveSettings(guildId) {
+  if (!dbEnabled) return false;
+  try {
+    const settings = getSettings(guildId);
+    const toSave = {};
+    for (const key of PERSISTED_SETTING_KEYS) toSave[key] = settings[key];
+    await redis('SET', `settings:${guildId}`, JSON.stringify(toSave));
+    return true;
+  } catch (error) {
+    console.error('설정 저장 실패(메모리에는 반영됨):', error.message);
+    return false;
+  }
+}
+
+async function loadSettings(guildId) {
+  if (!dbEnabled) return;
+  try {
+    const raw = await redis('GET', `settings:${guildId}`);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    const settings = getSettings(guildId);
+    for (const key of PERSISTED_SETTING_KEYS) {
+      if (saved[key] !== undefined) settings[key] = saved[key];
+    }
+  } catch (error) {
+    console.error('설정 불러오기 실패(기본값 사용):', error.message);
+  }
+}
+
+// ---- 날짜/시간 도우미 (한국 시간 기준) ----
+function kstNow() {
+  const d = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  return { y: d.getUTCFullYear(), m: d.getUTCMonth() + 1, d: d.getUTCDate(), h: d.getUTCHours() };
+}
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+function isLeapYear(y) {
+  return (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+}
+function isValidMonthDay(month, day) {
+  const daysInMonth = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]; // 2월은 29일까지 허용
+  return month >= 1 && month <= 12 && day >= 1 && day <= daysInMonth[month - 1];
+}
+
+// "10분", "2시간", "1일 3시간 30분" 같은 입력을 밀리초로 바꿉니다. 해석 불가면 null.
+function parseDuration(input) {
+  const unitMs = { 일: 86400000, 시간: 3600000, 시: 3600000, 분: 60000 };
+  let total = 0;
+  const rest = String(input).replace(/(\d+)\s*(일|시간|시|분)/g, (match, num, unit) => {
+    total += Number(num) * unitMs[unit];
+    return '';
+  });
+  if (rest.trim() !== '' || total === 0) return null;
+  return total;
+}
+
+// ---- 생일 ----
+const lastBirthdayCheckDate = new Map(); // guildId -> 'YYYY-MM-DD' (오늘 이미 확인했으면 DB를 다시 안 건드리려고)
+
+function pickAnnounceChannel(guild) {
+  const logChannelId = getSettings(guild.id).logChannelId;
+  return (logChannelId && guild.channels.cache.get(logChannelId)) || guild.systemChannel || null;
+}
+
+async function checkBirthdays() {
+  if (!dbEnabled || !client.isReady()) return;
+  const now = kstNow();
+  if (now.h < 9) return; // 오전 9시(한국 시간) 이후에 한 번 축하합니다
+  const dateKey = `${now.y}-${pad2(now.m)}-${pad2(now.d)}`;
+  const todayKeys = [`${pad2(now.m)}-${pad2(now.d)}`];
+  if (now.m === 2 && now.d === 28 && !isLeapYear(now.y)) todayKeys.push('02-29'); // 평년엔 2/29생은 2/28에
+
+  for (const guild of client.guilds.cache.values()) {
+    if (lastBirthdayCheckDate.get(guild.id) === dateKey) continue;
+    try {
+      const alreadySent = await redis('GET', `birthday_sent:${guild.id}`);
+      if (alreadySent === dateKey) {
+        lastBirthdayCheckDate.set(guild.id, dateKey);
+        continue;
+      }
+      const birthdays = hashToObject(await redis('HGETALL', `birthdays:${guild.id}`));
+      const userIds = Object.keys(birthdays).filter((id) => todayKeys.includes(birthdays[id]));
+      // 실패해도 매 분 재시도하며 도배하지 않도록, 확인했다는 표시는 먼저 남깁니다.
+      lastBirthdayCheckDate.set(guild.id, dateKey);
+      await redis('SET', `birthday_sent:${guild.id}`, dateKey);
+      if (userIds.length === 0) continue;
+
+      const channel = pickAnnounceChannel(guild);
+      if (!channel) {
+        console.error(`생일 알림을 보낼 채널이 없어요 (서버: ${guild.name}). /알림채널로 지정해주세요.`);
+        continue;
+      }
+      await channel.send({
+        content: `🎂 오늘은 ${userIds.map((id) => `<@${id}>`).join(', ')}님의 생일이에요! 모두 축하해주세요 🎉`,
+        allowedMentions: { users: userIds },
+      });
+    } catch (error) {
+      console.error(`생일 확인 오류 (서버: ${guild.name}):`, error.message);
+    }
+  }
+}
+
+// ---- 리마인더 ----
+const MAX_REMINDERS_PER_USER = 10;
+const MAX_REMINDER_MS = 30 * 86400000;
+
+async function listReminders(guildId, userId) {
+  const members = (await redis('ZRANGE', 'reminders', 0, -1)) || [];
+  const items = [];
+  for (const member of members) {
+    try {
+      const item = JSON.parse(member);
+      if (item.g === guildId && item.u === userId) items.push({ member, ...item });
+    } catch (e) {
+      // 깨진 항목은 무시
+    }
+  }
+  return items;
+}
+
+let reminderCheckRunning = false;
+async function checkReminders() {
+  if (!dbEnabled || !client.isReady() || reminderCheckRunning) return;
+  reminderCheckRunning = true;
+  try {
+    const nowMs = Date.now();
+    const due = (await redis('ZRANGEBYSCORE', 'reminders', '-inf', nowMs)) || [];
+    for (const member of due) {
+      // ZREM 결과가 1일 때만 "내가 가져갔다"고 보고 전송합니다 (중복 전송 방지).
+      const removed = await redis('ZREM', 'reminders', member);
+      if (Number(removed) !== 1) continue;
+      let item;
+      try {
+        item = JSON.parse(member);
+      } catch (e) {
+        continue;
+      }
+      const late = nowMs - item.d > 2 * 60 * 1000;
+      const text = `⏰ <@${item.u}> 리마인더: **${item.t}**${late ? '\n(봇이 쉬고 있어서 예정 시각보다 늦게 전달됐어요)' : ''}`;
+      try {
+        const channel = await client.channels.fetch(item.c);
+        await channel.send({ content: text, allowedMentions: { users: [item.u] } });
+      } catch (error) {
+        console.error('리마인더 채널 전송 실패, DM으로 시도합니다:', error.message);
+        try {
+          const user = await client.users.fetch(item.u);
+          await user.send(text.replace(`<@${item.u}> `, ''));
+        } catch (dmError) {
+          console.error('리마인더 DM 전송도 실패:', dmError.message);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('리마인더 확인 오류:', error.message);
+  } finally {
+    reminderCheckRunning = false;
+  }
+}
+
 function rateToString(rate) {
   return (rate >= 0 ? '+' : '') + rate + '%';
 }
@@ -797,6 +995,27 @@ const commands = [
         .setMinLength(2)
         .setMaxLength(5),
     ),
+  new SlashCommandBuilder()
+    .setName('생일등록')
+    .setDescription('내 생일을 등록하면 그날 알림 채널에서 축하해줘요')
+    .addIntegerOption((option) => option.setName('월').setDescription('태어난 달 (1~12)').setRequired(true).setMinValue(1).setMaxValue(12))
+    .addIntegerOption((option) => option.setName('일').setDescription('태어난 일 (1~31)').setRequired(true).setMinValue(1).setMaxValue(31)),
+  new SlashCommandBuilder().setName('생일삭제').setDescription('내 생일 등록을 삭제합니다'),
+  new SlashCommandBuilder().setName('생일목록').setDescription('이 서버에 등록된 생일 목록을 보여줍니다'),
+  new SlashCommandBuilder()
+    .setName('리마인더')
+    .setDescription('정해진 시간 뒤에 이 채널에서 알려드려요')
+    .addStringOption((option) =>
+      option.setName('언제').setDescription('얼마 뒤에? 예: 10분, 2시간, 1일 3시간 30분 (1분~30일)').setRequired(true),
+    )
+    .addStringOption((option) =>
+      option.setName('내용').setDescription('알려줄 내용').setRequired(true).setMaxLength(200),
+    ),
+  new SlashCommandBuilder().setName('리마인더목록').setDescription('내가 등록한 리마인더를 보여줍니다'),
+  new SlashCommandBuilder()
+    .setName('리마인더삭제')
+    .setDescription('내 리마인더를 취소합니다')
+    .addStringOption((option) => option.setName('번호').setDescription('/리마인더목록에 나온 번호').setRequired(true)),
 ].map((command) => command.toJSON());
 
 async function registerCommandsForGuild(guildId) {
@@ -927,10 +1146,26 @@ client.once(Events.ClientReady, async (c) => {
     await registerCommandsForGuild(guild.id);
   }
   console.log('✅ 슬래시 명령어 등록 완료');
+
+  if (dbEnabled) {
+    for (const guild of c.guilds.cache.values()) {
+      await loadSettings(guild.id);
+    }
+    console.log('🗄️ DB(Upstash Redis) 연결됨: 저장된 서버 설정을 불러왔어요.');
+    setInterval(() => checkReminders().catch((e) => console.error(e.message)), 60 * 1000);
+    setInterval(() => checkBirthdays().catch((e) => console.error(e.message)), 60 * 1000);
+    setTimeout(() => {
+      checkReminders().catch((e) => console.error(e.message));
+      checkBirthdays().catch((e) => console.error(e.message));
+    }, 5000);
+  } else {
+    console.log('ℹ️ UPSTASH_REDIS_REST_URL/TOKEN이 없어서 DB를 쓰지 않아요. (설정은 메모리 저장, 생일·리마인더 기능은 꺼짐)');
+  }
 });
 
 client.on(Events.GuildCreate, (guild) => {
   registerCommandsForGuild(guild.id);
+  loadSettings(guild.id);
 });
 
 // Render 무료 서버는 일정 시간 요청이 없으면 잠들었다가, 다음 요청이 올 때
@@ -1033,12 +1268,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
       settings.logChannelId = channel.id;
+      saveSettings(guildId);
       await interaction.reply({
-        content: `입퇴장 글자 알림을 <#${channel.id}> 채널에 올리도록 설정했어요.\n(봇이 재시작되면 해제되고 각 음성채널 채팅으로 돌아가요.)`,
+        content: `입퇴장 글자 알림을 <#${channel.id}> 채널에 올리도록 설정했어요.\n(DB에 저장돼서 봇이 재시작돼도 유지돼요.)`,
         ephemeral: true,
       });
     } else if (interaction.commandName === '알림채널해제') {
       settings.logChannelId = null;
+      saveSettings(guildId);
       await interaction.reply({
         content: '알림 채널 지정을 해제했어요. 이제 각 음성채널의 채팅에 글자 알림이 올라가요.',
         ephemeral: true,
@@ -1046,6 +1283,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } else if (interaction.commandName === '목소리') {
       const choice = interaction.options.getString('설정');
       settings.voice = choice === 'male' ? DEFAULT_VOICE : 'ko-KR-SunHiNeural';
+      saveSettings(guildId);
       await interaction.reply({
         content: `목소리를 ${voiceLabel(settings.voice)}로 설정했어요.`,
         ephemeral: true,
@@ -1053,6 +1291,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } else {
       const percent = interaction.options.getInteger('퍼센트');
       settings.rate = percent;
+      saveSettings(guildId);
       await interaction.reply({
         content: `말하기 속도를 ${rateToString(percent)}로 설정했어요.`,
         ephemeral: true,
@@ -1478,6 +1717,97 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } catch (error) {
       console.error('명언 조회 오류:', error.stack || error);
       await interaction.editReply('명언을 가져오는 중 오류가 발생했어요. 잠시 후 다시 시도해보세요.');
+    }
+    return;
+  }
+
+  // ===== 생일 / 리마인더 (DB 필요) =====
+  const dbCommands = ['생일등록', '생일삭제', '생일목록', '리마인더', '리마인더목록', '리마인더삭제'];
+  if (dbCommands.includes(interaction.commandName)) {
+    if (!dbEnabled) {
+      await interaction.reply({
+        content: '이 기능은 DB 설정이 필요해요. 봇 관리자가 Render 환경변수에 `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`을 등록해야 해요.',
+        ephemeral: true,
+      });
+      return;
+    }
+    const isPrivate = interaction.commandName !== '생일목록';
+    await interaction.deferReply({ ephemeral: isPrivate });
+    try {
+      if (interaction.commandName === '생일등록') {
+        const month = interaction.options.getInteger('월');
+        const day = interaction.options.getInteger('일');
+        if (!isValidMonthDay(month, day)) {
+          await interaction.editReply(`${month}월 ${day}일은 없는 날짜예요. 다시 확인해주세요.`);
+          return;
+        }
+        await redis('HSET', `birthdays:${guildId}`, interaction.user.id, `${pad2(month)}-${pad2(day)}`);
+        await interaction.editReply(`🎂 생일을 ${month}월 ${day}일로 등록했어요. 그날 한국 시간 오전 9시 이후에 알림 채널(없으면 서버 기본 채널)에서 축하해드릴게요.`);
+      } else if (interaction.commandName === '생일삭제') {
+        const removed = await redis('HDEL', `birthdays:${guildId}`, interaction.user.id);
+        await interaction.editReply(Number(removed) > 0 ? '등록된 생일을 삭제했어요.' : '이 서버에 등록된 내 생일이 없어요.');
+      } else if (interaction.commandName === '생일목록') {
+        const birthdays = hashToObject(await redis('HGETALL', `birthdays:${guildId}`));
+        const entries = Object.entries(birthdays).sort((a, b) => a[1].localeCompare(b[1]));
+        if (entries.length === 0) {
+          await interaction.editReply('아직 등록된 생일이 없어요. `/생일등록`으로 등록해보세요!');
+          return;
+        }
+        const lines = entries.slice(0, 50).map(([userId, md]) => `${Number(md.slice(0, 2))}월 ${Number(md.slice(3))}일 — <@${userId}>`);
+        const embed = new EmbedBuilder()
+          .setTitle('🎂 생일 목록')
+          .setDescription(lines.join('\n') + (entries.length > 50 ? `\n…외 ${entries.length - 50}명` : ''))
+          .setColor(0xff7675);
+        await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
+      } else if (interaction.commandName === '리마인더') {
+        const whenText = interaction.options.getString('언제');
+        const text = interaction.options.getString('내용').trim();
+        const durationMs = parseDuration(whenText);
+        if (durationMs === null) {
+          await interaction.editReply('시간을 이해하지 못했어요. `10분`, `2시간`, `1일 3시간 30분`처럼 입력해주세요.');
+          return;
+        }
+        if (durationMs < 60000) {
+          await interaction.editReply('최소 1분부터 설정할 수 있어요.');
+          return;
+        }
+        if (durationMs > MAX_REMINDER_MS) {
+          await interaction.editReply('최대 30일까지만 설정할 수 있어요.');
+          return;
+        }
+        const mine = await listReminders(guildId, interaction.user.id);
+        if (mine.length >= MAX_REMINDERS_PER_USER) {
+          await interaction.editReply(`리마인더는 한 사람당 최대 ${MAX_REMINDERS_PER_USER}개까지예요. \`/리마인더목록\`에서 확인하고 \`/리마인더삭제\`로 정리해주세요.`);
+          return;
+        }
+        const dueAt = Date.now() + durationMs;
+        const id = crypto.randomBytes(3).toString('hex');
+        const payload = JSON.stringify({ i: id, g: guildId, c: interaction.channelId, u: interaction.user.id, t: text, d: dueAt });
+        await redis('ZADD', 'reminders', dueAt, payload);
+        const unix = Math.floor(dueAt / 1000);
+        await interaction.editReply(`⏰ 리마인더를 등록했어요 (번호 \`${id}\`)\n<t:${unix}:f> (<t:${unix}:R>)에 이 채널에서 알려드릴게요: **${text}**`);
+      } else if (interaction.commandName === '리마인더목록') {
+        const mine = (await listReminders(guildId, interaction.user.id)).sort((a, b) => a.d - b.d);
+        if (mine.length === 0) {
+          await interaction.editReply('등록된 리마인더가 없어요.');
+          return;
+        }
+        const lines = mine.map((r) => `\`${r.i}\` — <t:${Math.floor(r.d / 1000)}:R> — ${r.t}`);
+        await interaction.editReply(`⏰ **내 리마인더**\n${lines.join('\n')}`);
+      } else if (interaction.commandName === '리마인더삭제') {
+        const id = interaction.options.getString('번호').trim();
+        const mine = await listReminders(guildId, interaction.user.id);
+        const target = mine.find((r) => r.i === id);
+        if (!target) {
+          await interaction.editReply('그 번호의 내 리마인더를 찾지 못했어요. `/리마인더목록`에서 번호를 확인해주세요.');
+          return;
+        }
+        await redis('ZREM', 'reminders', target.member);
+        await interaction.editReply(`리마인더 \`${id}\`를 취소했어요.`);
+      }
+    } catch (error) {
+      console.error('DB 기능 처리 오류:', error.stack || error);
+      await interaction.editReply('처리 중 오류가 발생했어요. DB 연결 상태를 확인하거나 잠시 후 다시 시도해주세요.');
     }
     return;
   }
