@@ -32,6 +32,7 @@ const {
   ChannelType,
   EmbedBuilder,
   AttachmentBuilder,
+  MessageFlags,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
@@ -1180,6 +1181,17 @@ setInterval(() => {
   console.log(`(상태 점검) 디스코드 핑: ${client.ws.ping}ms`);
 }, 5 * 60 * 1000);
 
+// ===== 진단 로그: 명령이 봇에 도착하는지, 디스코드로 보내는 응답이 성공하는지 확인용 =====
+// 디스코드 REST 요청(명령 응답 등)이 실패(HTTP 400 이상)하면 어떤 요청이 몇 번으로 실패했는지 남깁니다.
+client.rest.on('response', (request, response) => {
+  if (response.status >= 400) {
+    console.error(`🌐 디스코드 REST 실패: ${request.method} ${String(request.path).replace(/\/webhooks\/\d+\/[^/]+/, '/webhooks/…')} → HTTP ${response.status}`);
+  }
+});
+client.rest.on('invalidRequestWarning', (info) => console.error('🌐 디스코드 잘못된 요청 경고:', JSON.stringify(info)));
+client.on(Events.Error, (error) => console.error('⚠️ 디스코드 클라이언트 오류:', error.message));
+client.on(Events.Warn, (message) => console.warn('⚠️ 디스코드 경고:', message));
+
 client.on(Events.InteractionCreate, async (interaction) => {
  try {
   if (interaction.isChatInputCommand()) {
@@ -1187,6 +1199,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     // 이 값이 이미 2~3초를 넘으면, 봇 코드 문제가 아니라 서버가 잠들어있다가
     // 늦게 깨어난 것(콜드 스타트)이 원인이라는 뜻입니다.
     const delay = Date.now() - interaction.createdTimestamp;
+    console.log(`📥 /${interaction.commandName} 명령을 받았어요 (디스코드에서 생성된 지 ${delay}ms 뒤)`);
     if (delay > 2000) {
       console.warn(
         `⚠️ 인터랙션(/${interaction.commandName}) 처리 시작이 ${delay}ms 지연됐어요. ` +
@@ -1199,7 +1212,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.inGuild()) return;
     const game = rpsGames.get(interaction.channelId);
     if (!game) {
-      await interaction.reply({ content: '진행 중인 가위바위보가 없어요. `/가위바위보`로 새로 시작해주세요.', ephemeral: true });
+      await interaction.reply({ content: '진행 중인 가위바위보가 없어요. `/가위바위보`로 새로 시작해주세요.', flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -1207,12 +1220,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const userId = interaction.user.id;
 
     if (!game.players.has(userId) && game.players.size >= 2) {
-      await interaction.reply({ content: '이미 두 명이 참가했어요.', ephemeral: true });
+      await interaction.reply({ content: '이미 두 명이 참가했어요.', flags: MessageFlags.Ephemeral });
       return;
     }
 
     game.players.set(userId, { choice, username: interaction.user.displayName ?? interaction.user.username });
-    await interaction.reply({ content: `${RPS_LABELS[choice]}(을)를 선택했어요!`, ephemeral: true });
+    await interaction.reply({ content: `${RPS_LABELS[choice]}(을)를 선택했어요!`, flags: MessageFlags.Ephemeral });
 
     if (game.players.size < 2) return;
 
@@ -1249,7 +1262,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (!member.permissions.has(PermissionFlagsBits.ManageGuild)) {
       await interaction.reply({
         content: '이 명령어는 "서버 관리" 권한이 있는 사람만 사용할 수 있어요.',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -1263,7 +1276,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!perms || !perms.has(PermissionFlagsBits.ViewChannel) || !perms.has(PermissionFlagsBits.SendMessages)) {
         await interaction.reply({
           content: `봇이 <#${channel.id}> 채널에서 글을 쓸 수 없어요. 그 채널에서 봇 역할에 "채널 보기"와 "메시지 보내기" 권한을 준 뒤 다시 시도해주세요.`,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -1271,14 +1284,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       saveSettings(guildId);
       await interaction.reply({
         content: `입퇴장 글자 알림을 <#${channel.id}> 채널에 올리도록 설정했어요.\n(DB에 저장돼서 봇이 재시작돼도 유지돼요.)`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     } else if (interaction.commandName === '알림채널해제') {
       settings.logChannelId = null;
       saveSettings(guildId);
       await interaction.reply({
         content: '알림 채널 지정을 해제했어요. 이제 각 음성채널의 채팅에 글자 알림이 올라가요.',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     } else if (interaction.commandName === '목소리') {
       const choice = interaction.options.getString('설정');
@@ -1286,7 +1299,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       saveSettings(guildId);
       await interaction.reply({
         content: `목소리를 ${voiceLabel(settings.voice)}로 설정했어요.`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     } else {
       const percent = interaction.options.getInteger('퍼센트');
@@ -1294,7 +1307,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       saveSettings(guildId);
       await interaction.reply({
         content: `말하기 속도를 ${rateToString(percent)}로 설정했어요.`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
     return;
@@ -1304,7 +1317,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const settings = getSettings(guildId);
     await interaction.reply({
       content: `현재 목소리: ${voiceLabel(settings.voice)}\n현재 속도: ${rateToString(settings.rate)}\n입퇴장 글자 알림: ${settings.logChannelId ? `<#${settings.logChannelId}>` : '각 음성채널 채팅'}`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -1313,7 +1326,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.commandName === 'tts') {
     const voiceChannel = member.voice.channel;
     if (!voiceChannel) {
-      await interaction.reply({ content: '먼저 음성 채널에 들어가 있어야 해요.', ephemeral: true });
+      await interaction.reply({ content: '먼저 음성 채널에 들어가 있어야 해요.', flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -1424,7 +1437,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.commandName === '투표종료') {
     const poll = activePolls.get(interaction.channelId);
     if (!poll) {
-      await interaction.reply({ content: '이 채널에 마감할 투표가 없어요.', ephemeral: true });
+      await interaction.reply({ content: '이 채널에 마감할 투표가 없어요.', flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -1469,11 +1482,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       .filter((item) => item.length > 0);
 
     if (items.length < 2) {
-      await interaction.reply({ content: '항목을 쉼표(,)로 구분해서 2개 이상 입력해주세요. 예: `피자,치킨,족발`', ephemeral: true });
+      await interaction.reply({ content: '항목을 쉼표(,)로 구분해서 2개 이상 입력해주세요. 예: `피자,치킨,족발`', flags: MessageFlags.Ephemeral });
       return;
     }
     if (items.length > 10) {
-      await interaction.reply({ content: '항목은 최대 10개까지만 가능해요.', ephemeral: true });
+      await interaction.reply({ content: '항목은 최대 10개까지만 가능해요.', flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -1500,7 +1513,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   if (interaction.commandName === '끝말잇기시작') {
     if (wordChainGames.get(interaction.channelId)?.active) {
-      await interaction.reply({ content: '이미 이 채널에서 끝말잇기가 진행 중이에요.', ephemeral: true });
+      await interaction.reply({ content: '이미 이 채널에서 끝말잇기가 진행 중이에요.', flags: MessageFlags.Ephemeral });
       return;
     }
     wordChainGames.set(interaction.channelId, {
@@ -1519,7 +1532,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.commandName === '끝말잇기종료') {
     const game = wordChainGames.get(interaction.channelId);
     if (!game || !game.active) {
-      await interaction.reply({ content: '진행 중인 끝말잇기가 없어요.', ephemeral: true });
+      await interaction.reply({ content: '진행 중인 끝말잇기가 없어요.', flags: MessageFlags.Ephemeral });
       return;
     }
     wordChainGames.delete(interaction.channelId);
@@ -1538,7 +1551,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   if (interaction.commandName === '가위바위보') {
     if (rpsGames.get(interaction.channelId)) {
-      await interaction.reply({ content: '이미 이 채널에서 가위바위보가 진행 중이에요.', ephemeral: true });
+      await interaction.reply({ content: '이미 이 채널에서 가위바위보가 진행 중이에요.', flags: MessageFlags.Ephemeral });
       return;
     }
     rpsGames.set(interaction.channelId, { players: new Map() });
@@ -1727,12 +1740,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (!dbEnabled) {
       await interaction.reply({
         content: '이 기능은 DB 설정이 필요해요. 봇 관리자가 Render 환경변수에 `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`을 등록해야 해요.',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
     const isPrivate = interaction.commandName !== '생일목록';
-    await interaction.deferReply({ ephemeral: isPrivate });
+    await interaction.deferReply(isPrivate ? { flags: MessageFlags.Ephemeral } : {});
     try {
       if (interaction.commandName === '생일등록') {
         const month = interaction.options.getInteger('월');
@@ -1816,7 +1829,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.commandName === '삼행시') {
     const word = interaction.options.getString('제시어').trim();
     if (!/^[가-힣]{2,5}$/.test(word)) {
-      await interaction.reply({ content: '제시어는 한글 2~5글자만 가능해요. 예: `디스코드`', ephemeral: true });
+      await interaction.reply({ content: '제시어는 한글 2~5글자만 가능해요. 예: `디스코드`', flags: MessageFlags.Ephemeral });
       return;
     }
     await interaction.deferReply();
@@ -1847,7 +1860,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.deferred || interaction.replied) {
       await interaction.editReply('처리 중 오류가 발생했어요. 잠시 후 다시 시도해주세요.');
     } else if (interaction.isRepliable && interaction.isRepliable()) {
-      await interaction.reply({ content: '처리 중 오류가 발생했어요. 잠시 후 다시 시도해주세요.', ephemeral: true });
+      await interaction.reply({ content: '처리 중 오류가 발생했어요. 잠시 후 다시 시도해주세요.', flags: MessageFlags.Ephemeral });
     }
   } catch (replyError) {
     console.error('⚠️ 오류 응답 전송도 실패:', replyError.message);
