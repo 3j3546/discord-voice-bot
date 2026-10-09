@@ -239,6 +239,29 @@ http
     console.log(`(참고) 깨어있음 확인용 웹서버가 ${PORT} 포트에서 대기 중입니다.`);
   });
 
+// Render 무료 서버는 "바깥에서 들어오는 웹 접속"이 15분쯤 없으면 잠듭니다. UptimeRobot 같은 외부 서비스 대신,
+// 봇이 자기 자신의 공개 주소(Render가 RENDER_EXTERNAL_URL로 자동 제공)를 10분마다 직접 두드려서 깨어 있게 합니다.
+// (15분 직전인 14분은 아슬아슬해서 10분으로 잡았습니다. Render가 아닌 곳에서는 이 환경변수가 없어서 저절로 꺼집니다.)
+// 한계: 이미 잠들었거나 서버가 죽은 뒤에는 스스로 깨울 수 없고, 꺼졌을 때 알려주지도 못합니다.
+const SELF_PING_URL = process.env.RENDER_EXTERNAL_URL;
+const SELF_PING_MS = Number(process.env.SELF_PING_MS) || 10 * 60 * 1000;
+if (SELF_PING_URL) {
+  let selfPingOk = false;
+  setInterval(async () => {
+    try {
+      const r = await fetchWithTimeout(SELF_PING_URL, {}, 15000);
+      if (!selfPingOk) {
+        selfPingOk = true;
+        console.log(`(참고) 자기 주소 핑 성공 (HTTP ${r.status}). 이후 ${Math.round(SELF_PING_MS / 60000)}분마다 조용히 반복합니다.`);
+      }
+    } catch (error) {
+      selfPingOk = false;
+      console.error('자기 주소 핑 실패:', error.message);
+    }
+  }, SELF_PING_MS);
+  console.log(`(참고) 서버가 잠들지 않도록 ${Math.round(SELF_PING_MS / 60000)}분마다 자기 주소를 핑합니다: ${SELF_PING_URL}`);
+}
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
