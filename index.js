@@ -2035,27 +2035,36 @@ function splitForDiscord(text, limit = 1900) {
   return chunks;
 }
 
-async function askGemini(history, userText, systemPrompt = CHAT_SYSTEM_PROMPT) {
+// 한 번 요청. 일시적 오류(429/5xx/타임아웃)는 err.retryable = true 로 표시해서 바깥에서 재시도합니다.
+async function askGeminiOnce(model, history, userText, systemPrompt) {
   const contents = [
     ...history.map((h) => ({ role: h.role, parts: [{ text: h.text }] })),
     { role: 'user', parts: [{ text: userText }] },
   ];
-  const response = await fetchWithTimeout(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemPrompt }] },
-        contents,
-        generationConfig: { maxOutputTokens: 2048, temperature: 0.8 },
-      }),
-    },
-    30000,
-  );
+  let response;
+  try {
+    response = await fetchWithTimeout(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+          contents,
+          generationConfig: { maxOutputTokens: 2048, temperature: 0.8 },
+        }),
+      },
+      20000,
+    );
+  } catch (error) {
+    error.retryable = true; // 타임아웃/네트워크 오류
+    throw error;
+  }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(`Gemini HTTP ${response.status}: ${JSON.stringify(data.error || data).slice(0, 300)}`);
+    const error = new Error(`Gemini HTTP ${response.status} (${model}): ${JSON.stringify(data.error || data).slice(0, 200)}`);
+    error.retryable = response.status === 429 || response.status >= 500;
+    throw error;
   }
   const text = (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
   if (!text) {
@@ -2063,6 +2072,24 @@ async function askGemini(history, userText, systemPrompt = CHAT_SYSTEM_PROMPT) {
     return `(AI가 이 질문에는 답하지 않았어요: ${why})`;
   }
   return text;
+}
+
+// 주 모델이 붐비면(503 등) 잠깐 쉬었다 한 번 더, 그래도 안 되면 가벼운 예비 모델로 시도합니다.
+const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-flash-lite-latest';
+async function askGemini(history, userText, systemPrompt = CHAT_SYSTEM_PROMPT) {
+  const plan = [GEMINI_MODEL, GEMINI_MODEL, GEMINI_FALLBACK_MODEL];
+  let lastError;
+  for (let i = 0; i < plan.length; i++) {
+    try {
+      return await askGeminiOnce(plan[i], history, userText, systemPrompt);
+    } catch (error) {
+      lastError = error;
+      console.error(`Gemini 시도 ${i + 1}/${plan.length} 실패: ${error.message}`);
+      if (!error.retryable) break;
+      if (i === 0) await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+  }
+  throw lastError;
 }
 
 // AI와 끝말잇기: AI가 낼 단어를 Gemini에게 묻고, 사람과 똑같은 규칙(사전/이어말하기/중복)으로 검증합니다.
