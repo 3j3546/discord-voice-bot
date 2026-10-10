@@ -600,7 +600,7 @@ async function checkWordChain(game, word) {
 
 function getSettings(guildId) {
   if (!guildSettings.has(guildId)) {
-    guildSettings.set(guildId, { voice: DEFAULT_VOICE, rate: DEFAULT_RATE, logChannelId: null });
+    guildSettings.set(guildId, { voice: DEFAULT_VOICE, rate: DEFAULT_RATE, logChannelId: null, chatChannelId: null });
   }
   return guildSettings.get(guildId);
 }
@@ -640,7 +640,7 @@ function hashToObject(result) {
   return obj;
 }
 
-const PERSISTED_SETTING_KEYS = ['voice', 'rate', 'logChannelId'];
+const PERSISTED_SETTING_KEYS = ['voice', 'rate', 'logChannelId', 'chatChannelId'];
 
 async function saveSettings(guildId) {
   if (!dbEnabled) return false;
@@ -1043,6 +1043,21 @@ const commands = [
         .setMaxLength(5),
     ),
   new SlashCommandBuilder()
+    .setName('질문')
+    .setDescription('AI(Gemini)에게 무엇이든 물어봅니다')
+    .addStringOption((option) => option.setName('내용').setDescription('질문 내용').setRequired(true).setMaxLength(1000)),
+  new SlashCommandBuilder()
+    .setName('챗봇채널')
+    .setDescription('이 채널에서 아무 말이나 하면 AI가 대답하도록 지정합니다 (서버 관리 권한 필요)')
+    .addChannelOption((option) =>
+      option
+        .setName('채널')
+        .setDescription('AI와 대화할 텍스트 채널')
+        .setRequired(true)
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
+    ),
+  new SlashCommandBuilder().setName('챗봇채널해제').setDescription('챗봇 채널 지정을 해제합니다 (서버 관리 권한 필요)'),
+  new SlashCommandBuilder()
     .setName('생일등록')
     .setDescription('내 생일을 등록하면 그날 알림 채널에서 축하해줘요')
     .addIntegerOption((option) => option.setName('월').setDescription('태어난 달 (1~12)').setRequired(true).setMinValue(1).setMaxValue(12))
@@ -1305,7 +1320,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   const guildId = interaction.guildId;
 
   // ===== 설정 명령어 (서버 관리 권한 필요) =====
-  if (['목소리', '속도', '알림채널', '알림채널해제'].includes(interaction.commandName)) {
+  if (['목소리', '속도', '알림채널', '알림채널해제', '챗봇채널', '챗봇채널해제'].includes(interaction.commandName)) {
     if (!member.permissions.has(PermissionFlagsBits.ManageGuild)) {
       await interaction.reply({
         content: '이 명령어는 "서버 관리" 권한이 있는 사람만 사용할 수 있어요.',
@@ -1340,6 +1355,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
         content: '알림 채널 지정을 해제했어요. 이제 각 음성채널의 채팅에 글자 알림이 올라가요.',
         flags: MessageFlags.Ephemeral,
       });
+    } else if (interaction.commandName === '챗봇채널') {
+      const channel = interaction.options.getChannel('채널');
+      const me = interaction.guild.members.me;
+      const perms = me && channel.permissionsFor(me);
+      if (!perms || !perms.has(PermissionFlagsBits.ViewChannel) || !perms.has(PermissionFlagsBits.SendMessages)) {
+        await interaction.reply({
+          content: `봇이 <#${channel.id}> 채널에서 글을 쓸 수 없어요. 봇 역할에 "채널 보기"와 "메시지 보내기" 권한을 준 뒤 다시 시도해주세요.`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      settings.chatChannelId = channel.id;
+      saveSettings(guildId);
+      await interaction.reply({
+        content: `<#${channel.id}> 채널에서 말을 걸면 AI가 대답하도록 설정했어요.${GEMINI_API_KEY ? '' : '\n⚠️ 아직 GEMINI_API_KEY가 없어서 대답은 못 해요. Render 환경변수에 넣어주세요.'}`,
+        flags: MessageFlags.Ephemeral,
+      });
+    } else if (interaction.commandName === '챗봇채널해제') {
+      settings.chatChannelId = null;
+      saveSettings(guildId);
+      await interaction.reply({ content: '챗봇 채널 지정을 해제했어요. (/질문 과 @멘션은 계속 쓸 수 있어요)', flags: MessageFlags.Ephemeral });
     } else if (interaction.commandName === '목소리') {
       const choice = interaction.options.getString('설정');
       settings.voice = choice === 'male' ? DEFAULT_VOICE : 'ko-KR-SunHiNeural';
@@ -1872,6 +1908,31 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  // ===== AI 질문 (Gemini) =====
+  if (interaction.commandName === '질문') {
+    if (!GEMINI_API_KEY) {
+      await interaction.reply({ content: 'AI 기능이 아직 설정되지 않았어요. (GEMINI_API_KEY 필요)', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const wait = chatCooldownLeft(interaction.user.id);
+    if (wait > 0) {
+      await interaction.reply({ content: `조금만 천천히요! ${wait}초 뒤에 다시 물어봐주세요.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.deferReply();
+    const question = interaction.options.getString('내용');
+    try {
+      const answer = await askGemini([], question);
+      const chunks = splitForDiscord(`**Q.** ${question}\n\n${answer}`);
+      await interaction.editReply(chunks[0]);
+      for (const extra of chunks.slice(1, 3)) await interaction.followUp(extra);
+    } catch (error) {
+      console.error('Gemini 오류:', error.message);
+      await interaction.editReply('AI가 지금 대답하지 못했어요. 잠시 후 다시 시도해주세요.');
+    }
+    return;
+  }
+
   // ===== 삼행시 (누구나 사용 가능) =====
   if (interaction.commandName === '삼행시') {
     const word = interaction.options.getString('제시어').trim();
@@ -1915,9 +1976,103 @@ client.on(Events.InteractionCreate, async (interaction) => {
  }
 });
 
+// ===== AI 챗봇 (Google Gemini) =====
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest';
+const CHAT_SYSTEM_PROMPT =
+  '너는 디스코드 서버에서 대화하는 친근한 한국어 챗봇 "입퇴장알리미"야. ' +
+  '반말도 존댓말도 아닌 부드러운 말투로, 기본은 짧고 간결하게(5문장 안팎) 답해. ' +
+  '모르는 건 모른다고 말하고, 위험하거나 불법적인 요청은 정중히 거절해. 여러 사람이 대화하면 "이름: 내용" 형식으로 들어오니 이름을 구분해서 답해.';
+const chatHistory = new Map(); // 채널 ID -> 최근 대화 [{role, text}]
+const CHAT_HISTORY_MAX = 10;
+const chatLastUsed = new Map(); // 유저 ID -> 마지막 사용 시각
+const CHAT_COOLDOWN_MS = 4000;
+
+function chatCooldownLeft(userId) {
+  const left = CHAT_COOLDOWN_MS - (Date.now() - (chatLastUsed.get(userId) || 0));
+  if (left > 0) return Math.ceil(left / 1000);
+  chatLastUsed.set(userId, Date.now());
+  return 0;
+}
+
+function splitForDiscord(text, limit = 1900) {
+  const chunks = [];
+  let rest = String(text);
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf('\n', limit);
+    if (cut < limit / 2) cut = limit;
+    chunks.push(rest.slice(0, cut));
+    rest = rest.slice(cut).trimStart();
+  }
+  chunks.push(rest);
+  return chunks;
+}
+
+async function askGemini(history, userText) {
+  const contents = [
+    ...history.map((h) => ({ role: h.role, parts: [{ text: h.text }] })),
+    { role: 'user', parts: [{ text: userText }] },
+  ];
+  const response = await fetchWithTimeout(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: CHAT_SYSTEM_PROMPT }] },
+        contents,
+        generationConfig: { maxOutputTokens: 1024, temperature: 0.8 },
+      }),
+    },
+    30000,
+  );
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(`Gemini HTTP ${response.status}: ${JSON.stringify(data.error || data).slice(0, 300)}`);
+  }
+  const text = (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
+  if (!text) {
+    const why = data.promptFeedback?.blockReason || data.candidates?.[0]?.finishReason || '빈 응답';
+    return `(AI가 이 질문에는 답하지 않았어요: ${why})`;
+  }
+  return text;
+}
+
 // 끝말잇기 진행 중인 채널의 일반 채팅 메시지를 감시합니다.
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
+
+  // 챗봇: 지정된 채팅 채널의 모든 글, 또는 어느 채널이든 봇을 @멘션한 글에 AI가 대답합니다.
+  // (끝말잇기가 진행 중인 채널에서는 끝말잇기가 우선입니다.)
+  if (GEMINI_API_KEY && message.guild && !(wordChainGames.get(message.channelId) || {}).active) {
+    const isChatChannel = getSettings(message.guild.id).chatChannelId === message.channelId;
+    const mentioned = message.mentions.users.has(client.user.id) && !message.mentions.everyone;
+    if (isChatChannel || mentioned) {
+      const text = message.content.replace(new RegExp(`<@!?${client.user.id}>`, 'g'), '').trim();
+      if (text && !text.startsWith('/')) {
+        if (chatCooldownLeft(message.author.id) > 0) {
+          message.react('⏳').catch(() => {});
+          return;
+        }
+        message.channel.sendTyping().catch(() => {});
+        const history = chatHistory.get(message.channelId) || [];
+        const speaker = message.member?.displayName || message.author.username;
+        const userLine = `${speaker}: ${text.slice(0, 1000)}`;
+        try {
+          const answer = await askGemini(history, userLine);
+          history.push({ role: 'user', text: userLine }, { role: 'model', text: answer.slice(0, 1500) });
+          chatHistory.set(message.channelId, history.slice(-CHAT_HISTORY_MAX));
+          const chunks = splitForDiscord(answer);
+          await message.reply({ content: chunks[0], allowedMentions: { parse: [], repliedUser: false } });
+          for (const extra of chunks.slice(1, 3)) await message.channel.send({ content: extra, allowedMentions: { parse: [] } });
+        } catch (error) {
+          console.error('Gemini 오류:', error.message);
+          message.reply({ content: 'AI가 지금 대답하지 못했어요. 잠시 후 다시 시도해주세요.', allowedMentions: { repliedUser: false } }).catch(() => {});
+        }
+        return;
+      }
+    }
+  }
 
   const wordChainGame = wordChainGames.get(message.channelId);
   if (wordChainGame && wordChainGame.active) {
