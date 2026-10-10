@@ -969,7 +969,17 @@ const commands = [
     ),
   new SlashCommandBuilder()
     .setName('끝말잇기시작')
-    .setDescription('이 채널에서 끝말잇기를 시작합니다'),
+    .setDescription('이 채널에서 끝말잇기를 시작합니다')
+    .addStringOption((option) =>
+      option
+        .setName('상대')
+        .setDescription('누구와 할까요? (안 고르면 채널 사람들끼리)')
+        .setRequired(false)
+        .addChoices(
+          { name: '채널 사람들끼리', value: 'people' },
+          { name: 'AI와 1:1 대결', value: 'ai' },
+        ),
+    ),
   new SlashCommandBuilder()
     .setName('끝말잇기종료')
     .setDescription('이 채널의 끝말잇기를 종료합니다'),
@@ -1599,13 +1609,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.reply({ content: '이미 이 채널에서 끝말잇기가 진행 중이에요.', flags: MessageFlags.Ephemeral });
       return;
     }
+    const vsAi = interaction.options.getString('상대') === 'ai';
+    if (vsAi && !GEMINI_API_KEY) {
+      await interaction.reply({ content: 'AI 대결은 아직 설정되지 않았어요. (GEMINI_API_KEY 필요)', flags: MessageFlags.Ephemeral });
+      return;
+    }
     wordChainGames.set(interaction.channelId, {
       active: true,
       lastWord: null,
       usedWords: new Set(),
       lastAuthorId: null,
       secondLastAuthorId: null,
+      vsAi,
+      humanId: vsAi ? interaction.user.id : null,
+      busy: false,
     });
+    if (vsAi) {
+      await interaction.reply(
+        `🤖 **AI와 1:1 끝말잇기**를 시작합니다! <@${interaction.user.id}>님이 먼저 단어를 입력하세요 (두 글자 이상, 한글만, 한방단어는 내면 승리!).\n` +
+          'AI는 이 대결에 참가한 분의 글만 읽어요. 그만하려면 `/끝말잇기종료`',
+      );
+      return;
+    }
     await interaction.reply(
       '🔤 끝말잇기를 시작합니다! 아무 단어나 채팅에 입력해서 시작하세요 (두 글자 이상, 한글만, 한방단어 불가).',
     );
@@ -1620,7 +1645,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
     wordChainGames.delete(interaction.channelId);
 
-    if (game.lastAuthorId && game.secondLastAuthorId) {
+    if (game.vsAi) {
+      await interaction.reply(`🤖 AI와의 끝말잇기를 종료합니다. (총 ${game.usedWords.size}개 단어)`);
+    } else if (game.lastAuthorId && game.secondLastAuthorId) {
       await interaction.reply(
         `🔤 끝말잇기를 종료합니다. (총 ${game.usedWords.size}개 단어)\n<@${game.lastAuthorId}>님 승리 🏆 <@${game.secondLastAuthorId}>님 패배`,
       );
@@ -2008,7 +2035,7 @@ function splitForDiscord(text, limit = 1900) {
   return chunks;
 }
 
-async function askGemini(history, userText) {
+async function askGemini(history, userText, systemPrompt = CHAT_SYSTEM_PROMPT) {
   const contents = [
     ...history.map((h) => ({ role: h.role, parts: [{ text: h.text }] })),
     { role: 'user', parts: [{ text: userText }] },
@@ -2019,9 +2046,9 @@ async function askGemini(history, userText) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: CHAT_SYSTEM_PROMPT }] },
+        systemInstruction: { parts: [{ text: systemPrompt }] },
         contents,
-        generationConfig: { maxOutputTokens: 1024, temperature: 0.8 },
+        generationConfig: { maxOutputTokens: 2048, temperature: 0.8 },
       }),
     },
     30000,
@@ -2036,6 +2063,36 @@ async function askGemini(history, userText) {
     return `(AI가 이 질문에는 답하지 않았어요: ${why})`;
   }
   return text;
+}
+
+// AI와 끝말잇기: AI가 낼 단어를 Gemini에게 묻고, 사람과 똑같은 규칙(사전/이어말하기/중복)으로 검증합니다.
+// 규칙에 어긋나면 이유를 알려주며 최대 3번 다시 시도하고, 그래도 못 이으면 null(AI 패배)을 돌려줍니다.
+const AI_WORDCHAIN_SYSTEM =
+  '너는 한국어 끝말잇기 선수야. 표준국어대사전에 실제로 있는 2글자 이상의 한글 명사 하나만 답해. ' +
+  '설명, 따옴표, 기호, 줄바꿈 없이 단어 하나만 출력해.';
+
+async function aiWordChainTurn(game) {
+  const lastChar = game.lastWord[game.lastWord.length - 1];
+  const starts = getAcceptableStartChars(lastChar);
+  const rejected = [];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const prompt =
+      `끝말잇기야. 직전 단어는 "${game.lastWord}"이고, 반드시 ${starts.map((c) => `"${c}"`).join(' 또는 ')}(으)로 시작하는 단어를 내야 해.\n` +
+      `이미 나온 단어(사용 금지): ${[...game.usedWords].slice(-100).join(', ')}\n` +
+      (rejected.length ? `방금 실패한 시도(다시 쓰지 마): ${rejected.join(', ')}\n` : '') +
+      '단어 하나만 출력해.';
+    const raw = await askGemini([], prompt, AI_WORDCHAIN_SYSTEM);
+    const word = (raw.match(/[가-힣]{2,}/) || [])[0];
+    if (!word) {
+      rejected.push(`${raw.slice(0, 10)}(형식 오류)`);
+      continue;
+    }
+    const result = await checkWordChain(game, word);
+    if (result === null) return { word, win: false };
+    if (typeof result === 'object' && result.win) return { word, win: true };
+    rejected.push(`${word}(${String(result).replace(/\*/g, '')})`);
+  }
+  return null;
 }
 
 // 끝말잇기 진행 중인 채널의 일반 채팅 메시지를 감시합니다.
@@ -2076,15 +2133,59 @@ client.on(Events.MessageCreate, async (message) => {
 
   const wordChainGame = wordChainGames.get(message.channelId);
   if (wordChainGame && wordChainGame.active) {
+    if (wordChainGame.vsAi && (message.author.id !== wordChainGame.humanId || wordChainGame.busy)) return;
     const word = message.content.trim();
     const result = await checkWordChain(wordChainGame, word);
 
     if (result === null) {
+      const previous = {
+        lastWord: wordChainGame.lastWord,
+        secondLastAuthorId: wordChainGame.secondLastAuthorId,
+        lastAuthorId: wordChainGame.lastAuthorId,
+      };
       wordChainGame.usedWords.add(word);
       wordChainGame.lastWord = word;
       wordChainGame.secondLastAuthorId = wordChainGame.lastAuthorId;
       wordChainGame.lastAuthorId = message.author.id;
       message.react('✅').catch(() => {});
+
+      if (wordChainGame.vsAi) {
+        wordChainGame.busy = true;
+        message.channel.sendTyping().catch(() => {});
+        try {
+          const ai = await aiWordChainTurn(wordChainGame);
+          if (!ai) {
+            wordChainGames.delete(message.channelId);
+            await message.channel.send({
+              content: `🤖 AI가 **${word[word.length - 1]}**(으)로 시작하는 단어를 못 찾았어요!\n<@${message.author.id}>님 승리 🏆 (총 ${wordChainGame.usedWords.size}개 단어)`,
+              allowedMentions: { users: [message.author.id] },
+            });
+            return;
+          }
+          wordChainGame.usedWords.add(ai.word);
+          wordChainGame.lastWord = ai.word;
+          wordChainGame.secondLastAuthorId = wordChainGame.lastAuthorId;
+          wordChainGame.lastAuthorId = 'AI';
+          if (ai.win) {
+            wordChainGames.delete(message.channelId);
+            await message.channel.send(`🤖 **${ai.word}**\n한방단어예요! AI 승리 🏆 <@${message.author.id}>님 패배`);
+          } else {
+            await message.channel.send(
+              `🤖 **${ai.word}**\n이제 **${ai.word[ai.word.length - 1]}**(으)로 시작하는 단어를 입력하세요!`,
+            );
+          }
+        } catch (error) {
+          // AI 쪽 오류(서버 문제 등)는 사람의 잘못이 아니니, 방금 낸 단어를 없던 일로 하고 다시 내게 합니다.
+          console.error('AI 끝말잇기 오류:', error.message);
+          wordChainGame.usedWords.delete(word);
+          Object.assign(wordChainGame, previous);
+          message
+            .reply({ content: 'AI가 지금 대답하지 못했어요. 같은 단어를 다시 입력해주세요.', allowedMentions: { repliedUser: false } })
+            .catch(() => {});
+        } finally {
+          wordChainGame.busy = false;
+        }
+      }
       return;
     }
 
@@ -2094,7 +2195,9 @@ client.on(Events.MessageCreate, async (message) => {
       message.react('🏆').catch(() => {});
       message
         .reply({
-          content: `**${word}**는 한방단어예요!\n<@${message.author.id}>님 승리 🏆 <@${wordChainGame.lastAuthorId}>님 패배`,
+          content: wordChainGame.vsAi
+            ? `**${word}**는 한방단어예요!\n<@${message.author.id}>님 승리 🏆 AI 패배 🤖`
+            : `**${word}**는 한방단어예요!\n<@${message.author.id}>님 승리 🏆 <@${wordChainGame.lastAuthorId}>님 패배`,
           allowedMentions: { repliedUser: false },
         })
         .catch(() => {});
