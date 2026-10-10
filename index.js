@@ -13,12 +13,35 @@ try {
 
 // 외부 라이브러리에서 예기치 못한 오류가 나도
 // 봇 전체(입퇴장 안내 포함)가 죽지 않도록 안전장치를 겁니다.
+// 운영 알림: ALERT_WEBHOOK_URL(디스코드 웹훅 주소)이 있으면 켜짐/차단/오류를 그 채널에 글로 남깁니다.
+// 봇 로그인과 무관하게 동작하고, 실패해도 조용히 무시합니다.
+const ALERT_WEBHOOK_URL = process.env.ALERT_WEBHOOK_URL;
+const alertLastSent = new Map();
+async function alertOps(text, key = text) {
+  if (!ALERT_WEBHOOK_URL) return;
+  const now = Date.now();
+  if (now - (alertLastSent.get(key) || 0) < 60 * 1000) return; // 같은 알림은 1분에 한 번만
+  alertLastSent.set(key, now);
+  try {
+    await fetch(ALERT_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: String(text).slice(0, 1900), allowed_mentions: { parse: [] } }),
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch (error) {
+    console.error('(참고) 운영 알림 전송 실패:', error.message);
+  }
+}
+
 process.on('uncaughtException', (error) => {
   console.error('⚠️ 처리되지 않은 예외 발생 (봇은 계속 실행됩니다):', error.stack || error);
+  alertOps(`⚠️ 예외 발생 (봇은 계속 실행 중)\n\`\`\`${String((error && error.message) || error).slice(0, 500)}\`\`\``, 'exception');
 });
 process.on('unhandledRejection', (reason) => {
   console.error('⚠️ 처리되지 않은 Promise 거부 발생 (봇은 계속 실행됩니다):', (reason && reason.stack) || reason);
 });
+alertOps('🔄 봇 프로세스가 시작됐어요 (재배포/재시작/잠에서 깸). 로그인 중...', 'boot');
 
 const http = require('http');
 const {
@@ -1165,6 +1188,7 @@ async function speak(voiceChannel, text, voice) {
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ 로그인 완료: ${c.user.tag}`);
+  alertOps(`✅ 봇 준비 완료: ${c.user.tag}`, 'ready');
 
   for (const guild of c.guilds.cache.values()) {
     await registerCommandsForGuild(guild.id);
@@ -2032,6 +2056,7 @@ if (!process.env.DISCORD_TOKEN) {
         `⛔ 디스코드가 이 서버(Render)의 접속을 약 ${(waitSec / 3600).toFixed(1)}시간 동안 막고 있어요 (HTTP 429). ` +
           `로그인 시도 없이 ${Math.round(sleepMs / 60000)}분 뒤에 다시 확인합니다.`,
       );
+      alertOps(`⛔ 디스코드가 Render 서버 접속을 막고 있어요 (약 ${(waitSec / 3600).toFixed(1)}시간). ${Math.round(sleepMs / 60000)}분 뒤 재확인합니다.`, 'blocked');
       await new Promise((resolve) => setTimeout(resolve, sleepMs));
     }
 
@@ -2058,9 +2083,10 @@ if (!process.env.DISCORD_TOKEN) {
     // 90초가 지나도 로그인이 안 끝나면 시작 단계에서 멈춘 것입니다. 스스로 종료해서 Render가 새로 켜게 합니다.
     // (새로 켜지면 위의 "시작 전 점검"이 먼저 돌아서, 막힌 상태면 로그인을 시도하지 않고 기다립니다.)
     // 토큰이 틀린 경우는 멈추지 않고 "로그인 실패" 에러가 바로 나므로 여기에 해당하지 않습니다.
-    const startupHangKiller = setTimeout(() => {
+    const startupHangKiller = setTimeout(async () => {
       if (!client.isReady()) {
         console.error('❌ 로그인이 90초가 지나도 끝나지 않아서, 봇을 종료하고 Render가 다시 켜도록 합니다.');
+        await alertOps('❌ 로그인이 90초 넘게 멈춰서 봇을 재시작합니다.', 'hang');
         process.exit(1);
       }
     }, 90000);
@@ -2073,6 +2099,7 @@ if (!process.env.DISCORD_TOKEN) {
         clearTimeout(loginWatchdog);
         clearTimeout(startupHangKiller); // 에러로 실패한 건 "멈춤"이 아니므로 자동 종료 대상에서 뺍니다
         console.error('❌ 로그인 실패:', error.stack || error);
+        alertOps(`❌ 로그인 실패: ${String(error.message || error).slice(0, 300)}`, 'loginfail');
       });
   }
 
