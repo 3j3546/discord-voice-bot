@@ -1059,6 +1059,28 @@ const commands = [
     .addStringOption((option) => option.setName('정류장').setDescription('내가 기다리는 정류장 이름 (예: 청주시청)').setRequired(true).setMaxLength(30))
     .addStringOption((option) => option.setName('지역').setDescription('도시 이름 (안 쓰면 청주)').setRequired(false).setMaxLength(20)),
   new SlashCommandBuilder()
+    .setName('택배')
+    .setDescription('운송장번호로 택배 배송 상태를 조회합니다')
+    .addStringOption((option) =>
+      option
+        .setName('택배사')
+        .setDescription('택배사를 고르세요')
+        .setRequired(true)
+        .addChoices(
+          { name: 'CJ대한통운', value: 'cjkoreaexpress' },
+          { name: '우체국택배', value: 'koreapost' },
+          { name: '한진택배', value: 'hanjin' },
+          { name: '롯데택배', value: 'lotte' },
+          { name: '로젠택배', value: 'logen' },
+          { name: '경동택배', value: 'kyungdong' },
+          { name: 'GS25 편의점택배', value: 'gspostbox' },
+          { name: 'CU 편의점택배', value: 'cupost' },
+          { name: 'LX판토스', value: 'pantos' },
+          { name: '린코스', value: 'rincos' },
+        ),
+    )
+    .addStringOption((option) => option.setName('운송장번호').setDescription('운송장번호 (하이픈 없이 숫자만)').setRequired(true).setMaxLength(30)),
+  new SlashCommandBuilder()
     .setName('단어')
     .setDescription('단어의 뜻을 국립국어원 표준국어대사전에서 찾아줘요')
     .addStringOption((option) => option.setName('단어').setDescription('뜻을 알고 싶은 단어 (예: 어이없다)').setRequired(true).setMaxLength(30)),
@@ -2013,6 +2035,53 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  // ===== 택배 조회 =====
+  if (interaction.commandName === '택배') {
+    const courierCode = interaction.options.getString('택배사');
+    const number = interaction.options.getString('운송장번호').replace(/[\s-]/g, '');
+    if (!/^[A-Za-z0-9]{8,24}$/.test(number)) {
+      await interaction.reply({ content: '운송장번호는 하이픈 없이 숫자(또는 영문 숫자) 8~24자로 입력해주세요.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    // 운송장번호는 개인정보에 가까워서, 결과는 명령어를 쓴 본인에게만 보여줍니다.
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const courierName = PARCEL_COURIERS[courierCode] || courierCode;
+    try {
+      const result = await traceParcel(courierCode, number, interaction.user.id);
+      const checkpoints = [...(result.checkpoints || [])];
+      if (!checkpoints.length) {
+        await interaction.editReply(
+          `📦 **${courierName}** \`${number}\`\n조회된 배송 정보가 없어요.\n택배사를 잘못 골랐거나, 운송장번호가 틀렸거나, 아직 택배사에 접수되기 전일 수 있어요.`,
+        );
+        return;
+      }
+      // 최신 것이 위로 오도록 시간순 정렬(시간을 읽을 수 없으면 원래 순서의 반대로)
+      const times = checkpoints.map((c) => Date.parse(c.time));
+      if (times.every((t) => !Number.isNaN(t))) checkpoints.sort((a, b) => Date.parse(b.time) - Date.parse(a.time));
+      else checkpoints.reverse();
+      const recent = checkpoints.slice(0, 6).map((c) => {
+        const when = formatParcelTime(c.time);
+        const where = c.location ? ` · ${c.location}` : '';
+        return `**${when || '시간 미상'}**${where}\n${String(c.message || '').trim()}`;
+      });
+      const embed = new EmbedBuilder()
+        .setTitle(`📦 ${courierName} ${number}`)
+        .setColor(result.status === 'Delivered' || result.delivered ? 0x2ecc71 : 0x3498db)
+        .setDescription(
+          `**현재 상태: ${result.statusLabel || PARCEL_STATUS_LABEL[result.status] || result.status}**${result.itemName ? `\n품목: ${result.itemName}` : ''}\n\n${recent.join('\n\n')}`.slice(0, 4000),
+        )
+        .setFooter({ text: `최근 ${recent.length}건 표시 · 택배사 사이트 기준` });
+      await interaction.editReply({ embeds: [embed] });
+    } catch (error) {
+      console.error('택배 조회 오류:', error.code, error.message);
+      const known = { 10: '운송장번호 형식이 올바르지 않아요.', 11: '운송장번호 자릿수가 맞지 않아요.', 12: '이 택배사의 운송장번호 형식이 아니에요. 택배사를 다시 확인해주세요.' };
+      await interaction.editReply(
+        error.userMessage || known[error.code] || '택배 정보를 불러오지 못했어요. 택배사 사이트가 막혀 있거나 점검 중일 수 있어요. 잠시 후 다시 시도해주세요.',
+      );
+    }
+    return;
+  }
+
   // ===== 단어 뜻 (국립국어원 표준국어대사전) =====
   if (interaction.commandName === '단어') {
     if (!process.env.KOREAN_DICT_API_KEY) {
@@ -2252,6 +2321,149 @@ async function askGemini(history, userText, systemPrompt = CHAT_SYSTEM_PROMPT, t
     }
   }
   throw lastError;
+}
+
+// ===== 택배 조회 (npm 라이브러리 delivery-tracker, 키/토큰 없이 택배사 사이트를 직접 조회) =====
+const PARCEL_COURIERS = {
+  cjkoreaexpress: 'CJ대한통운',
+  koreapost: '우체국택배',
+  hanjin: '한진택배',
+  lotte: '롯데택배',
+  logen: '로젠택배',
+  kyungdong: '경동택배',
+  gspostbox: 'GS25 편의점택배',
+  cupost: 'CU 편의점택배',
+  pantos: 'LX판토스',
+  rincos: '린코스',
+};
+// 스마트택배(스윗트래커) 택배사 코드. SWEETTRACKER_API_KEY가 있으면 모든 택배사를 이쪽으로 조회합니다.
+const SWEET_CODES = { cjkoreaexpress: '04', koreapost: '01', hanjin: '05', lotte: '08', logen: '06', kyungdong: '23', gspostbox: '24', cupost: '46' };
+const SWEET_API_KEY = (process.env.SWEETTRACKER_API_KEY || '').trim();
+const SWEET_BASE = 'https://info.sweettracker.co.kr/api/v1';
+const SWEET_LEVEL_LABEL = { 1: '📝 상품 준비 중', 2: '📦 집화 완료', 3: '🚚 배송 중', 4: '🏢 배송지 도착', 5: '🏍️ 배송 출발', 6: '✅ 배송 완료' };
+// 스마트택배는 같은 운송장을 하루 20번까지만 조회할 수 있어서, 결과를 5분간 재사용하고 하루 횟수도 셉니다.
+const sweetDailyCount = new Map(); // "날짜:택배사:번호" -> 횟수
+const SWEET_DAILY_LIMIT = 15;
+const SWEET_MONTH_LIMIT = 95; // 무료 플랜: 월 100건
+const SWEET_USER_DAILY_LIMIT = 5;
+const sweetMonthMemory = new Map();
+const sweetUserDaily = new Map();
+
+async function traceViaSweetTracker(courierCode, number, userId) {
+  const code = SWEET_CODES[courierCode];
+  // 무료 플랜은 한 달 100건이라, 한 달 전체 상한(95건)과 한 사람당 하루 상한(5건)으로 아껴 씁니다.
+  // (캐시된 결과를 다시 보여주는 건 횟수에 안 들어갑니다.)
+  const kstNowDate = new Date(Date.now() + 9 * 3600 * 1000).toISOString();
+  const monthKey = `sweet_month:${kstNowDate.slice(0, 7)}`;
+  const userKey = `${kstNowDate.slice(0, 10)}:${userId}`;
+  if ((sweetUserDaily.get(userKey) || 0) >= SWEET_USER_DAILY_LIMIT) {
+    const error = new Error('사용자 일일 한도');
+    error.userMessage = `택배 조회는 한 사람당 하루 ${SWEET_USER_DAILY_LIMIT}번까지만 가능해요. (무료 조회량을 아끼기 위해서예요) 내일 다시 이용해주세요.`;
+    throw error;
+  }
+  let monthUsed;
+  if (dbEnabled) {
+    try {
+      monthUsed = Number(await redis('INCR', monthKey));
+      if (monthUsed === 1) await redis('EXPIRE', monthKey, String(40 * 24 * 3600));
+    } catch (error) {
+      console.error('택배 월 조회 횟수 기록 실패(메모리로 대체):', error.message);
+    }
+  }
+  if (monthUsed === undefined) monthUsed = (sweetMonthMemory.get(monthKey) || 0) + 1;
+  sweetMonthMemory.set(monthKey, monthUsed);
+  if (monthUsed > SWEET_MONTH_LIMIT) {
+    const error = new Error('월 조회 한도');
+    error.userMessage = '이번 달 무료 택배 조회량(월 100건)을 거의 다 써서 더 조회할 수 없어요. 다음 달에 다시 이용해주세요.';
+    throw error;
+  }
+  sweetUserDaily.set(userKey, (sweetUserDaily.get(userKey) || 0) + 1);
+  for (const k of sweetUserDaily.keys()) if (!k.startsWith(kstNowDate.slice(0, 10))) sweetUserDaily.delete(k);
+
+  const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+  const countKey = `${today}:${courierCode}:${number}`;
+  const used = sweetDailyCount.get(countKey) || 0;
+  if (used >= SWEET_DAILY_LIMIT) {
+    const error = new Error('오늘 이 운송장 조회 한도에 가까워졌어요.');
+    error.userMessage = '이 운송장은 오늘 너무 많이 조회해서 잠시 막아뒀어요. 내일 다시 조회해주세요. (택배 서비스의 하루 조회 한도 보호)';
+    throw error;
+  }
+  sweetDailyCount.set(countKey, used + 1);
+  for (const key of sweetDailyCount.keys()) if (!key.startsWith(today)) sweetDailyCount.delete(key);
+
+  const query = new URLSearchParams({ t_key: SWEET_API_KEY, t_code: code, t_invoice: number });
+  const response = await fetchWithTimeout(`${SWEET_BASE}/trackingInfo?${query}`, {}, 12000);
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`스마트택배 응답 형식 오류 (HTTP ${response.status}): ${text.replace(/\s+/g, ' ').slice(0, 150)}`);
+  }
+  if (data.status === false || data.code) {
+    const error = new Error(`스마트택배 오류 ${data.code}: ${data.msg}`);
+    error.userMessage = data.msg ? `조회할 수 없어요: ${data.msg}` : null;
+    throw error;
+  }
+  const details = Array.isArray(data.trackingDetails) ? data.trackingDetails : [];
+  return {
+    statusLabel: SWEET_LEVEL_LABEL[Number(data.level)] || null,
+    delivered: Number(data.level) === 6 || data.complete === true,
+    itemName: data.itemName || '',
+    checkpoints: details.map((d) => ({
+      time: d.timeString || '',
+      location: d.where || '',
+      message: [d.kind, d.manName ? `(담당 ${d.manName})` : ''].filter(Boolean).join(' '),
+    })),
+  };
+}
+
+const PARCEL_STATUS_LABEL = {
+  InfoReceived: '📝 접수',
+  Pending: '⏳ 대기',
+  InTransit: '🚚 배송 중',
+  Delivered: '✅ 배송 완료',
+  Returned: '↩️ 반송',
+  Exception: '⚠️ 문제 발생',
+  FailAttempt: '🚪 배달 실패(재시도 예정)',
+};
+const parcelCache = new Map(); // "택배사:번호" -> { at, result } (택배사 사이트를 너무 자주 두드리지 않으려고 1분간 재사용)
+let deliveryTrackerModule = null;
+
+async function traceParcel(courierCode, number, userId) {
+  const key = `${courierCode}:${number}`;
+  const cached = parcelCache.get(key);
+  const useSweet = Boolean(SWEET_API_KEY && SWEET_CODES[courierCode]);
+  if (cached && Date.now() - cached.at < (useSweet ? 5 * 60 * 1000 : 60 * 1000)) return cached.result;
+  let result;
+  if (useSweet) {
+    result = await traceViaSweetTracker(courierCode, number, userId);
+  } else {
+    if (!['cjkoreaexpress', 'koreapost', 'pantos', 'rincos'].includes(courierCode)) {
+      // 스마트택배 키가 없는데 한진/롯데 등을 고른 경우
+      const error = new Error('스마트택배 키 없음');
+      error.userMessage = `${PARCEL_COURIERS[courierCode]}은(는) 스마트택배 키(SWEETTRACKER_API_KEY)가 설정돼야 조회할 수 있어요. 지금은 CJ대한통운·우체국택배·LX판토스·린코스만 가능해요.`;
+      throw error;
+    }
+    // delivery-tracker는 ESM 전용이라 동적 import로 불러옵니다.
+    if (!deliveryTrackerModule) deliveryTrackerModule = await import('delivery-tracker');
+    result = await deliveryTrackerModule.courier(courierCode).trace(number);
+  }
+  parcelCache.set(key, { at: Date.now(), result });
+  if (parcelCache.size > 200) parcelCache.delete(parcelCache.keys().next().value);
+  return result;
+}
+
+function formatParcelTime(raw) {
+  if (!raw) return '';
+  if (String(raw).length <= 10) return String(raw); // 날짜만 있는 값
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return String(raw).replace('T', ' ').slice(0, 16);
+  // 시간대 표기가 없는 값(택배사가 준 한국 시각)은 그대로 보여주고, 있으면 한국 시각으로 바꿉니다.
+  if (!/[zZ]|[+-]\d\d:?\d\d$/.test(String(raw)) && String(raw).length > 10) return String(raw).replace('T', ' ').slice(0, 16);
+  const k = new Date(d.getTime() + 9 * 3600 * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${k.getUTCFullYear()}-${pad(k.getUTCMonth() + 1)}-${pad(k.getUTCDate())} ${pad(k.getUTCHours())}:${pad(k.getUTCMinutes())}`;
 }
 
 // ===== 기상청 날씨 (공공데이터포털 단기예보 API) =====
