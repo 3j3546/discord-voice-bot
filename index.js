@@ -1059,6 +1059,10 @@ const commands = [
     .addStringOption((option) => option.setName('정류장').setDescription('내가 기다리는 정류장 이름 (예: 청주시청)').setRequired(true).setMaxLength(30))
     .addStringOption((option) => option.setName('지역').setDescription('도시 이름 (안 쓰면 청주)').setRequired(false).setMaxLength(20)),
   new SlashCommandBuilder()
+    .setName('맞춤법')
+    .setDescription('문장의 맞춤법과 띄어쓰기를 AI가 고쳐줘요')
+    .addStringOption((option) => option.setName('문장').setDescription('검사할 문장 (최대 1000자)').setRequired(true).setMaxLength(1000)),
+  new SlashCommandBuilder()
     .setName('질문')
     .setDescription('AI(Gemini)에게 무엇이든 물어봅니다')
     .addStringOption((option) => option.setName('내용').setDescription('질문 내용').setRequired(true).setMaxLength(1000)),
@@ -2005,6 +2009,39 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  // ===== 맞춤법 검사 (Gemini) =====
+  if (interaction.commandName === '맞춤법') {
+    if (!GEMINI_API_KEY) {
+      await interaction.reply({ content: 'AI 기능이 아직 설정되지 않았어요. (GEMINI_API_KEY 필요)', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const wait = chatCooldownLeft(interaction.user.id);
+    if (wait > 0) {
+      await interaction.reply({ content: `조금만 천천히요! ${wait}초 뒤에 다시 시도해주세요.`, flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.deferReply();
+    const sentence = interaction.options.getString('문장');
+    try {
+      const raw = await askGemini([], sentence, SPELL_SYSTEM_PROMPT, 0.2);
+      const m = raw.match(/교정\s*[:：]\s*([\s\S]*?)(?:\n\s*고친 점\s*[:：]\s*([\s\S]*))?$/);
+      const fixed = m ? m[1].trim() : raw.trim();
+      const notes = m && m[2] ? m[2].trim() : '';
+      const same = fixed.replace(/\s+/g, '') === sentence.replace(/\s+/g, '') && fixed === sentence.trim();
+      const embed = new EmbedBuilder()
+        .setTitle(same ? '✅ 틀린 곳이 없어요' : '✏️ 맞춤법 교정')
+        .setColor(same ? 0x2ecc71 : 0xf1c40f)
+        .addFields({ name: '원문', value: sentence.slice(0, 1000) }, { name: '교정', value: fixed.slice(0, 1000) || '(없음)' });
+      if (notes && !/^없음/.test(notes)) embed.addFields({ name: '고친 점', value: notes.slice(0, 1000) });
+      embed.setFooter({ text: 'AI(Gemini) 교정이라 가끔 틀릴 수 있어요' });
+      await interaction.editReply({ embeds: [embed] });
+    } catch (error) {
+      console.error('맞춤법 검사 오류:', error.message);
+      await interaction.editReply('AI가 지금 대답하지 못했어요. 잠시 후 다시 시도해주세요.');
+    }
+    return;
+  }
+
   // ===== AI 질문 (Gemini) =====
   if (interaction.commandName === '질문') {
     if (!GEMINI_API_KEY) {
@@ -2083,7 +2120,7 @@ const CHAT_SYSTEM_PROMPT =
 const chatHistory = new Map(); // 채널 ID -> 최근 대화 [{role, text}]
 const CHAT_HISTORY_MAX = 10;
 const chatLastUsed = new Map(); // 유저 ID -> 마지막 사용 시각
-const CHAT_COOLDOWN_MS = 4000;
+const CHAT_COOLDOWN_MS = 500;
 
 function chatCooldownLeft(userId) {
   const left = CHAT_COOLDOWN_MS - (Date.now() - (chatLastUsed.get(userId) || 0));
@@ -2106,7 +2143,7 @@ function splitForDiscord(text, limit = 1900) {
 }
 
 // 한 번 요청. 일시적 오류(429/5xx/타임아웃)는 err.retryable = true 로 표시해서 바깥에서 재시도합니다.
-async function askGeminiOnce(model, history, userText, systemPrompt) {
+async function askGeminiOnce(model, history, userText, systemPrompt, temperature = 0.8) {
   const contents = [
     ...history.map((h) => ({ role: h.role, parts: [{ text: h.text }] })),
     { role: 'user', parts: [{ text: userText }] },
@@ -2121,7 +2158,7 @@ async function askGeminiOnce(model, history, userText, systemPrompt) {
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: systemPrompt }] },
           contents,
-          generationConfig: { maxOutputTokens: 2048, temperature: 0.8 },
+          generationConfig: { maxOutputTokens: 2048, temperature },
         }),
       },
       20000,
@@ -2146,12 +2183,12 @@ async function askGeminiOnce(model, history, userText, systemPrompt) {
 
 // 주 모델이 붐비면(503 등) 잠깐 쉬었다 한 번 더, 그래도 안 되면 가벼운 예비 모델로 시도합니다.
 const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-flash-lite-latest';
-async function askGemini(history, userText, systemPrompt = CHAT_SYSTEM_PROMPT) {
+async function askGemini(history, userText, systemPrompt = CHAT_SYSTEM_PROMPT, temperature = 0.8) {
   const plan = [GEMINI_MODEL, GEMINI_MODEL, GEMINI_FALLBACK_MODEL];
   let lastError;
   for (let i = 0; i < plan.length; i++) {
     try {
-      return await askGeminiOnce(plan[i], history, userText, systemPrompt);
+      return await askGeminiOnce(plan[i], history, userText, systemPrompt, temperature);
     } catch (error) {
       lastError = error;
       console.error(`Gemini 시도 ${i + 1}/${plan.length} 실패: ${error.message}`);
@@ -2360,6 +2397,13 @@ async function busLookup(regionInput, routeNo, stopName) {
   }
   return { city: city.name, wanted, stopCount: stops.length, results };
 }
+
+const SPELL_SYSTEM_PROMPT =
+  '너는 한국어 맞춤법 교정기야. 사용자가 준 글의 맞춤법, 띄어쓰기, 문법, 오탈자만 고치고, 말투·의미·내용은 바꾸지 마. 은어나 줄임말, 이모티콘은 그대로 둬. ' +
+  '반드시 아래 형식으로만 답해.\n' +
+  '교정: <고친 문장 전체>\n' +
+  '고친 점:\n- <틀린 표현> → <고친 표현> (이유 한 줄)\n' +
+  '(최대 6개까지만 쓰고, 고칠 곳이 없으면 "교정: <원문 그대로>" 다음 줄에 "고친 점: 없음"이라고만 써.)';
 
 // AI와 끝말잇기: AI가 낼 단어를 Gemini에게 묻고, 사람과 똑같은 규칙(사전/이어말하기/중복)으로 검증합니다.
 // 규칙에 어긋나면 이유를 알려주며 최대 3번 다시 시도하고, 그래도 못 이으면 null(AI 패배)을 돌려줍니다.
