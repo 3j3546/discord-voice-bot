@@ -1059,6 +1059,10 @@ const commands = [
     .addStringOption((option) => option.setName('정류장').setDescription('내가 기다리는 정류장 이름 (예: 청주시청)').setRequired(true).setMaxLength(30))
     .addStringOption((option) => option.setName('지역').setDescription('도시 이름 (안 쓰면 청주)').setRequired(false).setMaxLength(20)),
   new SlashCommandBuilder()
+    .setName('단어')
+    .setDescription('단어의 뜻을 국립국어원 표준국어대사전에서 찾아줘요')
+    .addStringOption((option) => option.setName('단어').setDescription('뜻을 알고 싶은 단어 (예: 어이없다)').setRequired(true).setMaxLength(30)),
+  new SlashCommandBuilder()
     .setName('맞춤법')
     .setDescription('문장의 맞춤법과 띄어쓰기를 AI가 고쳐줘요')
     .addStringOption((option) => option.setName('문장').setDescription('검사할 문장 (최대 1000자)').setRequired(true).setMaxLength(1000)),
@@ -2005,6 +2009,57 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } catch (error) {
       console.error('버스 조회 오류:', error.message);
       await interaction.editReply('버스 정보를 불러오지 못했어요. 잠시 후 다시 시도해주세요.');
+    }
+    return;
+  }
+
+  // ===== 단어 뜻 (국립국어원 표준국어대사전) =====
+  if (interaction.commandName === '단어') {
+    if (!process.env.KOREAN_DICT_API_KEY) {
+      await interaction.reply({ content: '사전 기능이 아직 설정되지 않았어요. (KOREAN_DICT_API_KEY 필요)', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.deferReply();
+    const query = interaction.options.getString('단어').trim();
+    try {
+      let items = toItemArray(await fetchDictJson(query, 'exact')).filter((i) => (i.word || '').replace(/-/g, '') === query.replace(/\s+/g, ''));
+      if (!items.length) {
+        // 정확히 같은 단어가 없으면 비슷한 단어를 알려줍니다.
+        const similar = toItemArray(await fetchDictJson(query, 'include'))
+          .map((i) => (i.word || '').replace(/-/g, ''))
+          .filter((w, idx, arr) => w && arr.indexOf(w) === idx)
+          .slice(0, 8);
+        await interaction.editReply(
+          similar.length
+            ? `"${query}"(은)는 사전에 없어요. 비슷한 단어: ${similar.join(', ')}`
+            : `"${query}"(은)는 사전에서 찾지 못했어요. 맞춤법을 확인하거나 기본형(예: 먹었다 → 먹다)으로 검색해보세요.`,
+        );
+        return;
+      }
+      const hasBatchim = (w) => {
+        const c = w.charCodeAt(w.length - 1);
+        return c >= 0xac00 && c <= 0xd7a3 && (c - 0xac00) % 28 !== 0;
+      };
+      const word = items[0].word.replace(/-/g, '');
+      const lines = [];
+      for (const item of items.slice(0, 3)) {
+        const senses = Array.isArray(item.sense) ? item.sense : item.sense ? [item.sense] : [];
+        for (const sense of senses.slice(0, 3)) {
+          const pos = sense.pos || item.pos;
+          lines.push(`${lines.length + 1}. ${pos ? `「${pos}」 ` : ''}${String(sense.definition || '').replace(/<[^>]+>/g, '').trim()}`);
+          if (lines.length >= 5) break;
+        }
+        if (lines.length >= 5) break;
+      }
+      const embed = new EmbedBuilder()
+        .setTitle(`📖 ${word}`)
+        .setDescription(`**${word}**${hasBatchim(word) ? '은' : '는'} 이런 뜻이에요.\n\n${lines.join('\n').slice(0, 3500)}`)
+        .setColor(0x3498db)
+        .setFooter({ text: '출처: 국립국어원 표준국어대사전' });
+      await interaction.editReply({ embeds: [embed] });
+    } catch (error) {
+      console.error('단어 조회 오류:', error.message);
+      await interaction.editReply('사전을 불러오지 못했어요. 잠시 후 다시 시도해주세요.');
     }
     return;
   }
