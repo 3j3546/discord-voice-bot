@@ -1053,6 +1053,12 @@ const commands = [
         .setMaxLength(5),
     ),
   new SlashCommandBuilder()
+    .setName('버스')
+    .setDescription('버스 도착 정보를 알려줘요 (버스가 지금 어디쯤인지, 몇 정거장/몇 분 남았는지)')
+    .addStringOption((option) => option.setName('번호').setDescription('버스 번호 (예: 502)').setRequired(true).setMaxLength(20))
+    .addStringOption((option) => option.setName('정류장').setDescription('내가 기다리는 정류장 이름 (예: 청주시청)').setRequired(true).setMaxLength(30))
+    .addStringOption((option) => option.setName('지역').setDescription('도시 이름 (안 쓰면 청주)').setRequired(false).setMaxLength(20)),
+  new SlashCommandBuilder()
     .setName('질문')
     .setDescription('AI(Gemini)에게 무엇이든 물어봅니다')
     .addStringOption((option) => option.setName('내용').setDescription('질문 내용').setRequired(true).setMaxLength(1000)),
@@ -1935,6 +1941,46 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  // ===== 버스 도착 정보 =====
+  if (interaction.commandName === '버스') {
+    if (!TAGO_API_KEY) {
+      await interaction.reply({ content: '버스 기능이 아직 설정되지 않았어요. (TAGO_API_KEY 필요)', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.deferReply();
+    const region = interaction.options.getString('지역') || DEFAULT_BUS_CITY;
+    const routeNo = interaction.options.getString('번호');
+    const stopName = interaction.options.getString('정류장');
+    try {
+      const r = await busLookup(region, routeNo, stopName);
+      if (r.error) {
+        await interaction.editReply(r.error);
+        return;
+      }
+      if (!r.results.length) {
+        await interaction.editReply(
+          `🚌 ${r.city} **${r.wanted}번** · "${stopName}" 정류장(${r.stopCount}곳 검색)에 도착 예정인 버스가 없어요.\n운행이 끝났거나 아직 출발 전이거나, 번호가 정류장을 지나지 않을 수 있어요.`,
+        );
+        return;
+      }
+      const lines = [];
+      for (const stop of r.results) {
+        lines.push(`🚏 **${stop.stopName}**${stop.stopNo ? ` (${stop.stopNo})` : ''}`);
+        for (const bus of stop.buses) {
+          const where = bus.currentStop ? `지금 **${bus.currentStop}** 부근 · ` : '';
+          const away = bus.stopsAway <= 0 ? '이번 정류장 도착 직전' : `**${bus.stopsAway}정거장** 전`;
+          lines.push(`　🚌 ${where}${away} · **${bus.eta}**`);
+        }
+      }
+      const embed = new EmbedBuilder().setTitle(`🚌 ${r.city} ${r.wanted}번`).setDescription(lines.join('\n').slice(0, 4000)).setColor(0x2ecc71);
+      await interaction.editReply({ embeds: [embed] });
+    } catch (error) {
+      console.error('버스 조회 오류:', error.message);
+      await interaction.editReply('버스 정보를 불러오지 못했어요. 잠시 후 다시 시도해주세요.');
+    }
+    return;
+  }
+
   // ===== AI 질문 (Gemini) =====
   if (interaction.commandName === '질문') {
     if (!GEMINI_API_KEY) {
@@ -2090,6 +2136,100 @@ async function askGemini(history, userText, systemPrompt = CHAT_SYSTEM_PROMPT) {
     }
   }
   throw lastError;
+}
+
+// ===== 버스 도착 정보 (국토교통부 TAGO, 공공데이터포털) =====
+// TAGO_API_KEY: data.go.kr에서 "국토교통부_(TAGO)_버스정류소정보 / 버스노선정보 / 버스도착정보" 3개를 활용신청한 뒤 받는 인증키.
+const TAGO_API_KEY = (process.env.TAGO_API_KEY || '').trim();
+const TAGO_BASE = 'https://apis.data.go.kr/1613000';
+const DEFAULT_BUS_CITY = '청주';
+const FALLBACK_CITY_CODES = { 청주: '33010' };
+let tagoCityCache = null;
+
+async function tagoGet(service, operation, params) {
+  const key = TAGO_API_KEY.includes('%') ? decodeURIComponent(TAGO_API_KEY) : TAGO_API_KEY; // Encoding 키를 넣어도 동작하게
+  const query = new URLSearchParams({ serviceKey: key, _type: 'json', numOfRows: '200', pageNo: '1', ...params });
+  const response = await fetchWithTimeout(`${TAGO_BASE}/${service}/${operation}?${query}`, {}, 10000);
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`TAGO 응답 형식 오류 (HTTP ${response.status}): ${text.replace(/\s+/g, ' ').slice(0, 150)}`);
+  }
+  const header = data.response && data.response.header;
+  if (header && header.resultCode && header.resultCode !== '00') {
+    throw new Error(`TAGO 오류 ${header.resultCode}: ${header.resultMsg}`);
+  }
+  const item = data.response && data.response.body && data.response.body.items && data.response.body.items.item;
+  if (!item) return [];
+  return Array.isArray(item) ? item : [item];
+}
+
+async function resolveBusCity(region) {
+  const name = region.trim().replace(/(특별시|광역시|특별자치시|특별자치도|시|도)$/, '');
+  if (!tagoCityCache) {
+    try {
+      const list = await tagoGet('BusSttnInfoInqireService', 'getCtyCodeList', {});
+      if (list.length) tagoCityCache = list.map((c) => ({ code: String(c.citycode), name: String(c.cityname) }));
+    } catch (error) {
+      console.error('TAGO 도시 목록 조회 실패(청주만 지원으로 대체):', error.message);
+    }
+  }
+  const cities = tagoCityCache || Object.entries(FALLBACK_CITY_CODES).map(([n, code]) => ({ code, name: n }));
+  const found = cities.find((c) => c.name === name || c.name.startsWith(name) || name.startsWith(c.name));
+  return found ? { code: found.code, name: found.name, all: cities } : { code: null, all: cities };
+}
+
+function formatBusEta(seconds) {
+  const sec = Number(seconds);
+  if (!Number.isFinite(sec)) return '시간 정보 없음';
+  if (sec < 60) return '곧 도착';
+  return `약 ${Math.round(sec / 60)}분`;
+}
+
+async function busLookup(regionInput, routeNo, stopName) {
+  const city = await resolveBusCity(regionInput);
+  if (!city.code) {
+    return { error: `"${regionInput}" 지역을 찾지 못했어요. 지원 지역: ${city.all.slice(0, 40).map((c) => c.name).join(', ')}` };
+  }
+  const stops = await tagoGet('BusSttnInfoInqireService', 'getSttnNoList', { cityCode: city.code, nodeNm: stopName });
+  if (!stops.length) return { error: `${city.name}에서 "${stopName}" 정류장을 찾지 못했어요. 이름을 줄여서 다시 시도해보세요. (예: "청주시청")` };
+
+  const wanted = routeNo.replace(/번$/, '').trim();
+  const routeStopCache = new Map();
+  const results = [];
+  for (const stop of stops.slice(0, 6)) {
+    const arrivals = (await tagoGet('ArvlInfoInqireService', 'getSttnAcctoArvlPrearngeInfoList', { cityCode: city.code, nodeId: stop.nodeid })).filter(
+      (a) => String(a.routeno) === wanted,
+    );
+    if (!arrivals.length) continue;
+    arrivals.sort((a, b) => Number(a.arrtime) - Number(b.arrtime));
+    const buses = [];
+    for (const arrival of arrivals.slice(0, 2)) {
+      let currentStop = null;
+      try {
+        if (!routeStopCache.has(arrival.routeid)) {
+          routeStopCache.set(
+            arrival.routeid,
+            await tagoGet('BusRouteInfoInqireService', 'getRouteAcctoThrghSttnList', { cityCode: city.code, routeId: arrival.routeid, numOfRows: '400' }),
+          );
+        }
+        const route = routeStopCache.get(arrival.routeid);
+        const mine = route.find((r) => String(r.nodeid) === String(stop.nodeid));
+        if (mine) {
+          const ord = Number(mine.nodeord) - Number(arrival.arrprevstationcnt);
+          const here = route.find((r) => Number(r.nodeord) === ord);
+          if (here) currentStop = here.nodenm;
+        }
+      } catch (error) {
+        console.error('버스 노선 정류장 조회 실패(현재 위치 생략):', error.message);
+      }
+      buses.push({ stopsAway: Number(arrival.arrprevstationcnt), eta: formatBusEta(arrival.arrtime), currentStop });
+    }
+    results.push({ stopName: stop.nodenm, stopNo: stop.nodeno, buses });
+  }
+  return { city: city.name, wanted, stopCount: stops.length, results };
 }
 
 // AI와 끝말잇기: AI가 낼 단어를 Gemini에게 묻고, 사람과 똑같은 규칙(사전/이어말하기/중복)으로 검증합니다.
