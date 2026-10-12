@@ -988,7 +988,7 @@ const commands = [
     .setDescription('버튼으로 진행하는 가위바위보 (최대 2명)'),
   new SlashCommandBuilder()
     .setName('날씨')
-    .setDescription('특정 지역의 오늘 날씨를 알려줍니다')
+    .setDescription('특정 지역의 현재 날씨를 알려줍니다 (기상청)')
     .addStringOption((option) =>
       option.setName('지역').setDescription('예: 청주시, 서울, 부산').setRequired(true),
     ),
@@ -1678,6 +1678,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
+  if (interaction.commandName === '날씨' && KMA_API_KEY) {
+    await interaction.deferReply();
+    const region = interaction.options.getString('지역');
+    try {
+      const w = await kmaWeather(region);
+      if (w.error) {
+        await interaction.editReply(w.error);
+        return;
+      }
+      const lines = [
+        `📍 **${w.label}**의 현재 날씨는 **${w.description}**이에요.`,
+        `🌡️ 현재 기온 ${w.temp}°C${w.tmx !== undefined ? ` · 오늘 최고 ${Math.round(w.tmx)}°C / 최저 ${Math.round(w.tmn)}°C` : ''}`,
+        `💧 습도 ${w.humidity}% · 🌬️ 바람 ${w.wind}m/s` + (w.popMax !== null ? ` · ☔ 오늘 강수확률 최대 ${w.popMax}%` : ''),
+      ];
+      if (w.rain && w.rain !== '강수없음' && Number(w.rain) > 0) lines.push(`🌧️ 최근 1시간 강수량 ${w.rain}mm`);
+      lines.push('', '출처: 기상청');
+      await interaction.editReply(lines.join('\n'));
+    } catch (error) {
+      console.error('기상청 날씨 조회 오류:', error.message);
+      await interaction.editReply('날씨 정보를 가져오는 중 오류가 발생했어요. 잠시 후 다시 시도해주세요.');
+    }
+    return;
+  }
+
   if (interaction.commandName === '날씨') {
     await interaction.deferReply();
     const region = interaction.options.getString('지역');
@@ -2136,6 +2160,111 @@ async function askGemini(history, userText, systemPrompt = CHAT_SYSTEM_PROMPT) {
     }
   }
   throw lastError;
+}
+
+// ===== 기상청 날씨 (공공데이터포털 단기예보 API) =====
+// 지역 이름 -> 좌표(Open-Meteo 지오코딩, 키 필요 없음) -> 기상청 격자(nx, ny) -> 초단기실황 + 단기예보.
+// 키는 버스와 같은 공공데이터포털 인증키(TAGO_API_KEY)를 그대로 쓰고, 따로 두고 싶으면 KMA_API_KEY를 쓰세요.
+// 단, 공공데이터포털에서 "기상청_단기예보 ((구)_동네예보) 조회서비스"도 활용신청이 되어 있어야 합니다.
+const KMA_API_KEY = (process.env.KMA_API_KEY || process.env.TAGO_API_KEY || '').trim();
+const KMA_BASE = 'https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0';
+const GEOCODE_BASE = 'https://geocoding-api.open-meteo.com/v1/search';
+
+// 위도/경도 -> 기상청 격자 좌표 (기상청 공식 Lambert 변환식)
+function latLonToKmaGrid(lat, lon) {
+  const RE = 6371.00877, GRID = 5.0, SLAT1 = 30.0, SLAT2 = 60.0, OLON = 126.0, OLAT = 38.0, XO = 43, YO = 136;
+  const D = Math.PI / 180;
+  const re = RE / GRID, slat1 = SLAT1 * D, slat2 = SLAT2 * D, olon = OLON * D, olat = OLAT * D;
+  let sn = Math.tan(Math.PI * 0.25 + slat2 * 0.5) / Math.tan(Math.PI * 0.25 + slat1 * 0.5);
+  sn = Math.log(Math.cos(slat1) / Math.cos(slat2)) / Math.log(sn);
+  let sf = Math.tan(Math.PI * 0.25 + slat1 * 0.5);
+  sf = (Math.pow(sf, sn) * Math.cos(slat1)) / sn;
+  let ro = Math.tan(Math.PI * 0.25 + olat * 0.5);
+  ro = (re * sf) / Math.pow(ro, sn);
+  let ra = Math.tan(Math.PI * 0.25 + lat * D * 0.5);
+  ra = (re * sf) / Math.pow(ra, sn);
+  let theta = lon * D - olon;
+  if (theta > Math.PI) theta -= 2 * Math.PI;
+  if (theta < -Math.PI) theta += 2 * Math.PI;
+  theta *= sn;
+  return { nx: Math.floor(ra * Math.sin(theta) + XO + 0.5), ny: Math.floor(ro - ra * Math.cos(theta) + YO + 0.5) };
+}
+
+async function geocodeKorea(region) {
+  const names = [region.trim(), region.trim().replace(/(특별시|광역시|특별자치시|특별자치도|시|군|구)$/, '')];
+  for (const name of [...new Set(names)].filter(Boolean)) {
+    const url = `${GEOCODE_BASE}?name=${encodeURIComponent(name)}&count=5&language=ko&countryCode=KR`;
+    const response = await fetchWithTimeout(url, {}, 8000);
+    if (!response.ok) continue;
+    const data = await response.json().catch(() => ({}));
+    const hit = (data.results || []).find((r) => r.country_code === 'KR');
+    if (hit) return { lat: hit.latitude, lon: hit.longitude, label: [hit.admin1, hit.name].filter((v, i, a) => v && a.indexOf(v) === i).join(' ') };
+  }
+  return null;
+}
+
+async function kmaGet(operation, params) {
+  const key = KMA_API_KEY.includes('%') ? decodeURIComponent(KMA_API_KEY) : KMA_API_KEY;
+  const query = new URLSearchParams({ serviceKey: key, dataType: 'JSON', pageNo: '1', ...params });
+  const response = await fetchWithTimeout(`${KMA_BASE}/${operation}?${query}`, {}, 10000);
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`기상청 응답 형식 오류 (HTTP ${response.status}): ${text.replace(/\s+/g, ' ').slice(0, 150)}`);
+  }
+  const header = data.response && data.response.header;
+  if (header && header.resultCode !== '00') throw new Error(`기상청 오류 ${header.resultCode}: ${header.resultMsg}`);
+  const item = data.response && data.response.body && data.response.body.items && data.response.body.items.item;
+  return !item ? [] : Array.isArray(item) ? item : [item];
+}
+
+const KMA_SKY = { 1: '맑음', 3: '구름많음', 4: '흐림' };
+const KMA_PTY = { 1: '비', 2: '비/눈', 3: '눈', 4: '소나기', 5: '빗방울', 6: '빗방울/눈날림', 7: '눈날림' };
+
+async function kmaWeather(region) {
+  const place = await geocodeKorea(region);
+  if (!place) return { error: `"${region}" 지역을 찾지 못했어요. "청주", "서울 강남구"처럼 도시나 구 이름으로 다시 시도해보세요.` };
+  const { nx, ny } = latLonToKmaGrid(place.lat, place.lon);
+
+  const pad = (n) => String(n).padStart(2, '0');
+  const kst = new Date(Date.now() + 9 * 3600 * 1000);
+  const ymd = (d) => `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
+  // 초단기실황: 매시 정각 자료가 약 40분 뒤에 올라옵니다.
+  const ncstTime = new Date(kst.getTime() - 40 * 60 * 1000);
+  // 단기예보: 오늘 02시 발표분에 오늘 최저/최고가 들어있습니다 (02:15 전이면 어제 23시 발표분).
+  const early = kst.getUTCHours() * 60 + kst.getUTCMinutes() < 2 * 60 + 15;
+  const fcstBase = early ? new Date(kst.getTime() - 24 * 3600 * 1000) : kst;
+  const today = ymd(kst);
+
+  const [ncst, fcst] = await Promise.all([
+    kmaGet('getUltraSrtNcst', { numOfRows: '20', base_date: ymd(ncstTime), base_time: `${pad(ncstTime.getUTCHours())}00`, nx, ny }),
+    kmaGet('getVilageFcst', { numOfRows: '1000', base_date: ymd(fcstBase), base_time: early ? '2300' : '0200', nx, ny }),
+  ]);
+
+  const now = Object.fromEntries(ncst.map((i) => [i.category, i.obsrValue]));
+  const todays = fcst.filter((i) => i.fcstDate === today);
+  const pick = (cat) => todays.filter((i) => i.category === cat);
+  const tmn = (pick('TMN')[0] || {}).fcstValue;
+  const tmx = (pick('TMX')[0] || {}).fcstValue;
+  const pops = pick('POP').map((i) => Number(i.fcstValue));
+  const nowHour = Number(`${pad(kst.getUTCHours())}00`);
+  const sky = pick('SKY').find((i) => Number(i.fcstTime) >= nowHour) || pick('SKY').slice(-1)[0];
+
+  const pty = Number(now.PTY || 0);
+  const description = pty ? KMA_PTY[pty] || '강수' : (sky && KMA_SKY[Number(sky.fcstValue)]) || '정보 없음';
+  return {
+    label: place.label || region,
+    description,
+    temp: now.T1H,
+    humidity: now.REH,
+    wind: now.WSD,
+    rain: now.RN1,
+    tmn,
+    tmx,
+    popMax: pops.length ? Math.max(...pops) : null,
+  };
 }
 
 // ===== 버스 도착 정보 (국토교통부 TAGO, 공공데이터포털) =====
