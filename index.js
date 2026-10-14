@@ -1293,7 +1293,16 @@ setInterval(() => {
 // 디스코드 REST 요청(명령 응답 등)이 실패(HTTP 400 이상)하면 어떤 요청이 몇 번으로 실패했는지 남깁니다.
 client.rest.on('response', (request, response) => {
   if (response.status >= 400) {
-    console.error(`🌐 디스코드 REST 실패: ${request.method} ${String(request.path).replace(/\/webhooks\/\d+\/[^/]+/, '/webhooks/…')} → HTTP ${response.status}`);
+    const path = String(request.path).replace(/\/webhooks\/\d+\/[^/]+/, '/webhooks/…').replace(/\/interactions\/\d+\/[^/]+/, '/interactions/…');
+    console.error(`🌐 디스코드 REST 실패: ${request.method} ${path} → HTTP ${response.status}`);
+    if (response.status === 429) {
+      // 429가 "이 봇이 너무 많이 보내서"인지, "서버(IP) 단위 차단(Cloudflare)"인지 구분할 수 있게 헤더를 남깁니다.
+      const h = response.headers || {};
+      console.error(
+        `   ↳ 429 상세: retry-after=${h['retry-after']} / scope=${h['x-ratelimit-scope']} / global=${h['x-ratelimit-global']} / ` +
+          `server=${h.server} / content-type=${h['content-type']} / cf-ray=${h['cf-ray']}`,
+      );
+    }
   }
 });
 client.rest.on('invalidRequestWarning', (info) => console.error('🌐 디스코드 잘못된 요청 경고:', JSON.stringify(info)));
@@ -2850,24 +2859,24 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
 
   // 새로운 음성채널 입장
   if (!oldState.channelId && newState.channelId) {
-    speak(newState.channel, `${nickname}님이 입장했습니다`);
-    postVoiceLog(newState.channel, `🟢 **${nickname}**님이 입장했습니다`);
+    speak(newState.channel, `${nickname}님 안녕하세요`);
+    postVoiceLog(newState.channel, `🟢 **${nickname}**님이 입장했습니다!^^`);
     return;
   }
 
   // 음성채널에서 완전히 퇴장
   if (oldState.channelId && !newState.channelId) {
-    speak(oldState.channel, `${nickname}님이 퇴장했습니다`);
-    postVoiceLog(oldState.channel, `🔴 **${nickname}**님이 퇴장했습니다`);
+    speak(oldState.channel, `${nickname}님 바이요`);
+    postVoiceLog(oldState.channel, `🔴 **${nickname}**님이 퇴장했습니다!^^`);
     return;
   }
 
   // 다른 음성채널로 이동
   if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
-    speak(oldState.channel, `${nickname}님이 채널을 이동했습니다`);
-    speak(newState.channel, `${nickname}님이 입장했습니다`);
-    postVoiceLog(oldState.channel, `🔀 **${nickname}**님이 **${newState.channel.name}** 채널로 이동했습니다`);
-    postVoiceLog(newState.channel, `🟢 **${nickname}**님이 입장했습니다 (**${oldState.channel.name}**에서 이동)`);
+    speak(oldState.channel, `${nickname}님이 채널을 이동하셨습니다!`);
+    speak(newState.channel, `${nickname}님 하이요`);
+    postVoiceLog(oldState.channel, `🔀 **${nickname}**님이 **${newState.channel.name}** 채널로 이동했습니다!^^`);
+    postVoiceLog(newState.channel, `🟢 **${nickname}**님이 입장했습니다!^^ (**${oldState.channel.name}**에서 이동)`);
   }
 });
 
