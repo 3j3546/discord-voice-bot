@@ -2979,3 +2979,5 @@ if (!process.env.DISCORD_TOKEN) {
 
   startBot().catch((error) => console.error('❌ 시작 중 오류:', error.stack || error));
 }
+// 개발자:사려주세요
+// 유용한코드;
