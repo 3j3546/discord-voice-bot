@@ -71,6 +71,7 @@ const {
   StreamType,
 } = require('@discordjs/voice');
 const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
+const { Readable } = require('stream');
 const sharp = require('sharp');
 const GIFEncoder = require('gif-encoder-2');
 const fs = require('fs');
@@ -266,7 +267,11 @@ http
 // 봇이 자기 자신의 공개 주소(Render가 RENDER_EXTERNAL_URL로 자동 제공)를 10분마다 직접 두드려서 깨어 있게 합니다.
 // (15분 직전인 14분은 아슬아슬해서 10분으로 잡았습니다. Render가 아닌 곳에서는 이 환경변수가 없어서 저절로 꺼집니다.)
 // 한계: 이미 잠들었거나 서버가 죽은 뒤에는 스스로 깨울 수 없고, 꺼졌을 때 알려주지도 못합니다.
-const SELF_PING_URL = process.env.RENDER_EXTERNAL_URL;
+// Render(RENDER_EXTERNAL_URL)뿐 아니라 Koyeb(KOYEB_PUBLIC_DOMAIN)이나 직접 지정(SELF_PING_URL)도 지원합니다.
+const SELF_PING_URL =
+  process.env.RENDER_EXTERNAL_URL ||
+  process.env.SELF_PING_URL ||
+  (process.env.KOYEB_PUBLIC_DOMAIN ? `https://${process.env.KOYEB_PUBLIC_DOMAIN}` : undefined);
 const SELF_PING_MS = Number(process.env.SELF_PING_MS) || 10 * 60 * 1000;
 if (SELF_PING_URL) {
   let selfPingOk = false;
@@ -1161,6 +1166,119 @@ function scheduleLeave(guildId) {
   disconnectTimers.set(guildId, timer);
 }
 
+
+// ===== SK open API A.X TTS (국내 음성합성) =====
+// 월 5,000자까지 무료(초과 시 0.06원/자 후불)라서, 봇이 스스로 월 한도(기본 4,500자)를 넘기지 않게 막고
+// 한도 초과/오류/300자 초과일 때는 기존 Edge TTS로 자동 전환합니다. 같은 문장은 캐시해서 글자 수를 아낍니다.
+const SK_TTS_APP_KEY = process.env.SK_TTS_APP_KEY;
+const SK_TTS_MODEL = process.env.SK_TTS_MODEL || 'axtts-2-6';
+const SK_TTS_VOICE_FEMALE = process.env.SK_TTS_VOICE_FEMALE || 'aria';
+const SK_TTS_VOICE_MALE = process.env.SK_TTS_VOICE_MALE || '';
+const SK_TTS_MONTH_LIMIT = Number(process.env.SK_TTS_MONTH_LIMIT || 4500);
+const skTtsCache = new Map(); // `${voice}|${speed}|${text}` -> PCM(48kHz 스테레오 16bit) Buffer
+let skMemUsage = { month: '', chars: 0 };
+
+function skMonthKey() {
+  return `sktts_month:${new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 7)}`;
+}
+
+// WAV(16bit PCM)를 디스코드가 받는 48kHz 스테레오 PCM으로 바꿉니다(ffmpeg 없이).
+function wavToDiscordPcm(buf) {
+  if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF') throw new Error('WAV 형식이 아니에요.');
+  let pos = 12;
+  let fmt = null;
+  let data = null;
+  while (pos + 8 <= buf.length) {
+    const id = buf.toString('ascii', pos, pos + 4);
+    let size = buf.readUInt32LE(pos + 4);
+    const start = pos + 8;
+    if (id === 'data') {
+      if (size === 0 || start + size > buf.length) size = buf.length - start; // 스트리밍 WAV 대비
+      data = buf.subarray(start, start + size);
+      break;
+    }
+    if (id === 'fmt ') fmt = { channels: buf.readUInt16LE(start + 2), rate: buf.readUInt32LE(start + 4), bits: buf.readUInt16LE(start + 14) };
+    pos = start + size + (size % 2);
+  }
+  if (!fmt || !data) throw new Error('WAV 헤더를 읽지 못했어요.');
+  if (fmt.bits !== 16) throw new Error(`지원하지 않는 WAV(${fmt.bits}bit)예요.`);
+  const frames = Math.floor(data.length / (2 * fmt.channels));
+  const outFrames = Math.floor((frames * 48000) / fmt.rate);
+  const out = Buffer.alloc(outFrames * 4);
+  const sample = (frame) => data.readInt16LE(Math.min(frame, frames - 1) * 2 * fmt.channels);
+  for (let i = 0; i < outFrames; i++) {
+    const src = (i * fmt.rate) / 48000;
+    const i0 = Math.floor(src);
+    const frac = src - i0;
+    const v = Math.round(sample(i0) * (1 - frac) + sample(i0 + 1) * frac);
+    out.writeInt16LE(v, i * 4);
+    out.writeInt16LE(v, i * 4 + 2);
+  }
+  return out;
+}
+
+async function skReserveChars(n) {
+  if (dbEnabled) {
+    const key = skMonthKey();
+    const used = Number(await redis('INCRBY', key, n));
+    await redis('EXPIRE', key, 60 * 60 * 24 * 40);
+    if (used > SK_TTS_MONTH_LIMIT) return false;
+    return true;
+  }
+  const month = skMonthKey();
+  if (skMemUsage.month !== month) skMemUsage = { month, chars: 0 };
+  if (skMemUsage.chars + n > SK_TTS_MONTH_LIMIT) return false;
+  skMemUsage.chars += n;
+  return true;
+}
+
+// 성공하면 PCM Buffer, SK를 쓸 수 없으면 null(→ Edge TTS로 넘어감)
+async function synthSkTts(text, edgeVoice, ratePercent) {
+  if (!SK_TTS_APP_KEY) return null;
+  const isMale = edgeVoice === DEFAULT_VOICE;
+  const voice = isMale ? SK_TTS_VOICE_MALE : SK_TTS_VOICE_FEMALE;
+  if (!voice) return null;
+  if (text.length >= 300) return null;
+  const speed = Math.min(2, Math.max(0.5, 1 + ratePercent / 100)).toFixed(2);
+  const cacheKey = `${voice}|${speed}|${text}`;
+  if (skTtsCache.has(cacheKey)) return skTtsCache.get(cacheKey);
+
+  try {
+    if (!(await skReserveChars(text.length))) {
+      console.warn(`[SK TTS] 이번 달 한도(${SK_TTS_MONTH_LIMIT}자)에 도달해서 Edge TTS로 대신해요.`);
+      return null;
+    }
+  } catch (e) {
+    console.error('[SK TTS] 사용량 기록 실패 → 안전하게 Edge TTS로 대신해요:', e.message);
+    return null;
+  }
+
+  const res = await fetch('https://apis.openapi.sk.com/axtts/tts', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'audio/wav', appKey: SK_TTS_APP_KEY },
+    body: JSON.stringify({ model: SK_TTS_MODEL, voice, text, speed, sr: 22050, sformat: 'wav', clientId: 'discord-voice-bot' }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`SK TTS HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const pcm = wavToDiscordPcm(Buffer.from(await res.arrayBuffer()));
+  if (skTtsCache.size >= 100) skTtsCache.delete(skTtsCache.keys().next().value);
+  skTtsCache.set(cacheKey, pcm);
+  return pcm;
+}
+
+async function logSkVoices() {
+  if (!SK_TTS_APP_KEY) return;
+  try {
+    const res = await fetch(`https://apis.openapi.sk.com/axtts/voice?model=${SK_TTS_MODEL}`, {
+      headers: { accept: 'text/plain', appKey: SK_TTS_APP_KEY },
+      signal: AbortSignal.timeout(10_000),
+    });
+    console.log(`[SK TTS] ${SK_TTS_MODEL} 보이스 목록 (HTTP ${res.status}): ${(await res.text()).slice(0, 1500)}`);
+  } catch (e) {
+    console.error('[SK TTS] 보이스 목록 조회 실패:', e.message);
+  }
+}
+
 // ===== 입퇴장 안내(TTS) 재생 큐 =====
 const guildAudio = new Map();
 
@@ -1201,10 +1319,49 @@ async function playNext(guildId) {
   const settings = getSettings(guildId);
   const voice = item.voice || settings.voice; // /tts에서 목소리를 따로 골랐으면 그걸 우선 사용
 
+  // 1순위: SK A.X TTS (키가 있고 월 한도 안일 때). 실패하면 아래 Edge TTS로 넘어갑니다.
+  try {
+    const pcm = await synthSkTts(item.text, voice, settings.rate);
+    if (pcm) {
+      state.player.play(createAudioResource(Readable.from([pcm]), { inputType: StreamType.Raw }));
+      return;
+    }
+  } catch (error) {
+    console.error('[SK TTS 실패 → Edge TTS로 대신해요]', error.message);
+  }
+
   try {
     const tts = new MsEdgeTTS();
     await tts.setMetadata(voice, OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
     const { audioStream } = tts.toStream(item.text, { rate: rateToString(settings.rate) });
+
+    // 마이크로소프트 TTS 서버가 응답하지 않거나 오류를 내면, 예전에는 아무 소리 없이 영원히 멈췄습니다.
+    // 이제는 오류/무응답을 로그로 남기고(원인 파악용), 대기열을 풀어서 봇이 정상 상태로 돌아오게 합니다.
+    let gotData = false;
+    let failed = false;
+    const recover = (reason) => {
+      if (failed) return;
+      failed = true;
+      console.error(`[안내 음성 생성 실패] 길드 ${guildId}: ${reason}`);
+      try {
+        audioStream.destroy();
+      } catch {}
+      state.player.stop(true);
+      state.playing = false;
+      if (state.queue.length > 0) {
+        playNext(guildId);
+      } else {
+        scheduleLeave(guildId);
+      }
+    };
+    audioStream.once('data', () => {
+      gotData = true;
+    });
+    audioStream.on('error', (error) => recover(`스트림 오류: ${error && error.message}`));
+    setTimeout(() => {
+      if (!gotData) recover('15초 동안 음성 데이터가 오지 않았어요 (TTS 서버 응답 없음/차단 가능성)');
+    }, 15000);
+
     const resource = createAudioResource(audioStream, { inputType: StreamType.WebmOpus });
     state.player.play(resource);
   } catch (error) {
@@ -1250,6 +1407,10 @@ async function speak(voiceChannel, text, voice) {
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ 로그인 완료: ${c.user.tag}`);
   alertOps(`✅ 봇 준비 완료: ${c.user.tag}`, 'ready');
+  try {
+    console.log(`[TTS] msedge-tts 버전: ${require('msedge-tts/package.json').version}`);
+  } catch {}
+  logSkVoices();
 
   for (const guild of c.guilds.cache.values()) {
     await registerCommandsForGuild(guild.id);
@@ -2859,24 +3020,24 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
 
   // 새로운 음성채널 입장
   if (!oldState.channelId && newState.channelId) {
-    speak(newState.channel, `${nickname}님 안녕하세요`);
-    postVoiceLog(newState.channel, `🟢 **${nickname}**님이 입장했습니다!^^`);
+    speak(newState.channel, `${nickname}님이 입장했습니다`);
+    postVoiceLog(newState.channel, `🟢 **${nickname}**님이 입장했습니다`);
     return;
   }
 
   // 음성채널에서 완전히 퇴장
   if (oldState.channelId && !newState.channelId) {
-    speak(oldState.channel, `${nickname}님 바이요`);
-    postVoiceLog(oldState.channel, `🔴 **${nickname}**님이 퇴장했습니다!^^`);
+    speak(oldState.channel, `${nickname}님이 퇴장했습니다`);
+    postVoiceLog(oldState.channel, `🔴 **${nickname}**님이 퇴장했습니다`);
     return;
   }
 
   // 다른 음성채널로 이동
   if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
-    speak(oldState.channel, `${nickname}님이 채널을 이동하셨습니다!`);
-    speak(newState.channel, `${nickname}님 하이요`);
-    postVoiceLog(oldState.channel, `🔀 **${nickname}**님이 **${newState.channel.name}** 채널로 이동했습니다!^^`);
-    postVoiceLog(newState.channel, `🟢 **${nickname}**님이 입장했습니다!^^ (**${oldState.channel.name}**에서 이동)`);
+    speak(oldState.channel, `${nickname}님이 채널을 이동했습니다`);
+    speak(newState.channel, `${nickname}님이 입장했습니다`);
+    postVoiceLog(oldState.channel, `🔀 **${nickname}**님이 **${newState.channel.name}** 채널로 이동했습니다`);
+    postVoiceLog(newState.channel, `🟢 **${nickname}**님이 입장했습니다 (**${oldState.channel.name}**에서 이동)`);
   }
 });
 
@@ -2979,5 +3140,3 @@ if (!process.env.DISCORD_TOKEN) {
 
   startBot().catch((error) => console.error('❌ 시작 중 오류:', error.stack || error));
 }
-// 개발자:사려주세요
-// 유용한코드;
