@@ -60,18 +60,6 @@ const {
   ButtonBuilder,
   ButtonStyle,
 } = require('discord.js');
-const {
-  joinVoiceChannel,
-  getVoiceConnection,
-  createAudioPlayer,
-  createAudioResource,
-  AudioPlayerStatus,
-  VoiceConnectionStatus,
-  entersState,
-  StreamType,
-} = require('@discordjs/voice');
-const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
-const { Readable } = require('stream');
 const sharp = require('sharp');
 const GIFEncoder = require('gif-encoder-2');
 const fs = require('fs');
@@ -245,11 +233,6 @@ async function makeAcrostic(word) {
   return fallbackLines ? { lines: fallbackLines, exact: false } : null;
 }
 
-// ===== 기본 음성 설정 (/목소리, /속도 명령어로 서버별로 바꿀 수 있습니다) =====
-const DEFAULT_VOICE = 'ko-KR-InJoonNeural'; // 남자 목소리. 여자 목소리는 'ko-KR-SunHiNeural'
-const DEFAULT_RATE = 25; // 기본 속도(%). 0이 보통 속도, 25면 25% 빠르게
-// ======================================================================
-
 // Render 같은 무료 웹 호스팅은 일정 시간 요청이 없으면 서버를 재웁니다.
 // 외부에서 주기적으로 핑을 보낼 수 있는 아주 작은 웹 서버를 하나 띄워서 이를 방지합니다.
 // (디스코드 봇 동작 자체와는 무관합니다.)
@@ -304,7 +287,7 @@ const client = new Client({
   rest: { timeout: 10_000 },
 });
 
-// 길드(서버)별 목소리/속도 설정을 저장합니다.
+// 길드(서버)별 설정을 저장합니다.
 // 주의: 메모리에만 저장되므로 봇이 재시작되면 기본값으로 초기화됩니다.
 const guildSettings = new Map();
 
@@ -605,13 +588,13 @@ async function checkWordChain(game, word) {
 
 function getSettings(guildId) {
   if (!guildSettings.has(guildId)) {
-    guildSettings.set(guildId, { voice: DEFAULT_VOICE, rate: DEFAULT_RATE, logChannelId: null, chatChannelId: null });
+    guildSettings.set(guildId, { logChannelId: null, chatChannelId: null });
   }
   return guildSettings.get(guildId);
 }
 
 // ===== DB (Upstash Redis, REST 방식) =====
-// 서버별 설정(목소리/속도/알림 채널), 생일, 리마인더를 저장합니다. 몽고DB와 달리 별도 패키지 없이
+// 서버별 설정(알림 채널 등), 생일, 리마인더를 저장합니다. 몽고DB와 달리 별도 패키지 없이
 // 그냥 HTTPS 요청(fetch)만 쓰고, 환경변수 2개(UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN)만 있으면 됩니다.
 // 환경변수가 없으면 DB 기능만 꺼지고(설정은 메모리 저장으로 동작), 봇의 나머지 기능은 전부 그대로 동작합니다.
 const UPSTASH_URL = (process.env.UPSTASH_REDIS_REST_URL || '').trim().replace(/\/+$/, '');
@@ -645,7 +628,7 @@ function hashToObject(result) {
   return obj;
 }
 
-const PERSISTED_SETTING_KEYS = ['voice', 'rate', 'logChannelId', 'chatChannelId'];
+const PERSISTED_SETTING_KEYS = ['logChannelId', 'chatChannelId'];
 
 async function saveSettings(guildId) {
   if (!dbEnabled) return false;
@@ -807,13 +790,6 @@ async function checkReminders() {
   }
 }
 
-function rateToString(rate) {
-  return (rate >= 0 ? '+' : '') + rate + '%';
-}
-
-function voiceLabel(voice) {
-  return voice === DEFAULT_VOICE ? '남자 (인준)' : '여자 (선희)';
-}
 
 // DeepL 번역 API를 이용한 번역.
 // DEEPL_API_KEY 환경변수가 필요합니다 (deepl.com에서 무료 가입, 신용카드 불필요,
@@ -875,46 +851,6 @@ async function translateToEnglishIfKorean(text) {
 // ===== 슬래시 명령어 정의 =====
 const commands = [
   new SlashCommandBuilder()
-    .setName('목소리')
-    .setDescription('안내 음성의 목소리를 바꿉니다')
-    .addStringOption((option) =>
-      option
-        .setName('설정')
-        .setDescription('남자 또는 여자 목소리')
-        .setRequired(true)
-        .addChoices(
-          { name: '남자 (인준)', value: 'male' },
-          { name: '여자 (선희)', value: 'female' },
-        ),
-    ),
-  new SlashCommandBuilder()
-    .setName('속도')
-    .setDescription('안내 음성의 말하기 속도를 바꿉니다')
-    .addIntegerOption((option) =>
-      option
-        .setName('퍼센트')
-        .setDescription('기본 속도 대비 몇 % 빠르게 할지 (-50 ~ 100)')
-        .setRequired(true)
-        .setMinValue(-50)
-        .setMaxValue(100),
-    ),
-  new SlashCommandBuilder()
-    .setName('tts')
-    .setDescription('입력한 내용을 봇이 음성 채널에서 말해줍니다')
-    .addStringOption((option) =>
-      option.setName('내용').setDescription('말할 내용').setRequired(true),
-    )
-    .addStringOption((option) =>
-      option
-        .setName('목소리')
-        .setDescription('목소리 (안 고르면 서버 기본 목소리로 말해요)')
-        .setRequired(false)
-        .addChoices(
-          { name: '남자 (인준)', value: 'male' },
-          { name: '여자 (선희)', value: 'female' },
-        ),
-    ),
-  new SlashCommandBuilder()
     .setName('알림채널')
     .setDescription('입퇴장 글자 알림을 올릴 텍스트 채널을 지정합니다 (서버 관리 권한 필요)')
     .addChannelOption((option) =>
@@ -929,7 +865,7 @@ const commands = [
     .setDescription('지정한 알림 채널을 해제합니다 (다시 각 음성채널 채팅에 올라갑니다)'),
   new SlashCommandBuilder()
     .setName('설정확인')
-    .setDescription('현재 목소리/속도 설정을 확인합니다'),
+    .setDescription('현재 알림 채널 설정을 확인합니다'),
   new SlashCommandBuilder()
     .setName('이미지')
     .setDescription('AI로 이미지를 생성합니다')
@@ -1142,275 +1078,9 @@ async function registerCommandsForGuild(guildId) {
   }
 }
 
-// 안내가 끝난 뒤 채널을 나가기 전에 대기하는 시간(밀리초)
-const LEAVE_DELAY_MS = 3000;
-
-// 길드별로 "잠시 후 나가기" 예약 타이머를 관리합니다.
-const disconnectTimers = new Map();
-
-function cancelScheduledLeave(guildId) {
-  const timer = disconnectTimers.get(guildId);
-  if (timer) {
-    clearTimeout(timer);
-    disconnectTimers.delete(guildId);
-  }
-}
-
-function scheduleLeave(guildId) {
-  cancelScheduledLeave(guildId);
-  const timer = setTimeout(() => {
-    disconnectTimers.delete(guildId);
-    const connection = getVoiceConnection(guildId);
-    if (connection) connection.destroy();
-  }, LEAVE_DELAY_MS);
-  disconnectTimers.set(guildId, timer);
-}
-
-
-// ===== SK open API A.X TTS (국내 음성합성) =====
-// 월 5,000자까지 무료(초과 시 0.06원/자 후불)라서, 봇이 스스로 월 한도(기본 4,500자)를 넘기지 않게 막고
-// 한도 초과/오류/300자 초과일 때는 기존 Edge TTS로 자동 전환합니다. 같은 문장은 캐시해서 글자 수를 아낍니다.
-const SK_TTS_APP_KEY = process.env.SK_TTS_APP_KEY;
-const SK_TTS_MODEL = process.env.SK_TTS_MODEL || 'axtts-2-6';
-const SK_TTS_VOICE_FEMALE = process.env.SK_TTS_VOICE_FEMALE || 'aria';
-const SK_TTS_VOICE_MALE = process.env.SK_TTS_VOICE_MALE || '';
-const SK_TTS_MONTH_LIMIT = Number(process.env.SK_TTS_MONTH_LIMIT || 4500);
-const skTtsCache = new Map(); // `${voice}|${speed}|${text}` -> PCM(48kHz 스테레오 16bit) Buffer
-let skMemUsage = { month: '', chars: 0 };
-
-function skMonthKey() {
-  return `sktts_month:${new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 7)}`;
-}
-
-// WAV(16bit PCM)를 디스코드가 받는 48kHz 스테레오 PCM으로 바꿉니다(ffmpeg 없이).
-function wavToDiscordPcm(buf) {
-  if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF') throw new Error('WAV 형식이 아니에요.');
-  let pos = 12;
-  let fmt = null;
-  let data = null;
-  while (pos + 8 <= buf.length) {
-    const id = buf.toString('ascii', pos, pos + 4);
-    let size = buf.readUInt32LE(pos + 4);
-    const start = pos + 8;
-    if (id === 'data') {
-      if (size === 0 || start + size > buf.length) size = buf.length - start; // 스트리밍 WAV 대비
-      data = buf.subarray(start, start + size);
-      break;
-    }
-    if (id === 'fmt ') fmt = { channels: buf.readUInt16LE(start + 2), rate: buf.readUInt32LE(start + 4), bits: buf.readUInt16LE(start + 14) };
-    pos = start + size + (size % 2);
-  }
-  if (!fmt || !data) throw new Error('WAV 헤더를 읽지 못했어요.');
-  if (fmt.bits !== 16) throw new Error(`지원하지 않는 WAV(${fmt.bits}bit)예요.`);
-  const frames = Math.floor(data.length / (2 * fmt.channels));
-  const outFrames = Math.floor((frames * 48000) / fmt.rate);
-  const out = Buffer.alloc(outFrames * 4);
-  const sample = (frame) => data.readInt16LE(Math.min(frame, frames - 1) * 2 * fmt.channels);
-  for (let i = 0; i < outFrames; i++) {
-    const src = (i * fmt.rate) / 48000;
-    const i0 = Math.floor(src);
-    const frac = src - i0;
-    const v = Math.round(sample(i0) * (1 - frac) + sample(i0 + 1) * frac);
-    out.writeInt16LE(v, i * 4);
-    out.writeInt16LE(v, i * 4 + 2);
-  }
-  return out;
-}
-
-async function skReserveChars(n) {
-  if (dbEnabled) {
-    const key = skMonthKey();
-    const used = Number(await redis('INCRBY', key, n));
-    await redis('EXPIRE', key, 60 * 60 * 24 * 40);
-    if (used > SK_TTS_MONTH_LIMIT) return false;
-    return true;
-  }
-  const month = skMonthKey();
-  if (skMemUsage.month !== month) skMemUsage = { month, chars: 0 };
-  if (skMemUsage.chars + n > SK_TTS_MONTH_LIMIT) return false;
-  skMemUsage.chars += n;
-  return true;
-}
-
-// 성공하면 PCM Buffer, SK를 쓸 수 없으면 null(→ Edge TTS로 넘어감)
-async function synthSkTts(text, edgeVoice, ratePercent) {
-  if (!SK_TTS_APP_KEY) return null;
-  const isMale = edgeVoice === DEFAULT_VOICE;
-  const voice = isMale ? SK_TTS_VOICE_MALE : SK_TTS_VOICE_FEMALE;
-  if (!voice) return null;
-  if (text.length >= 300) return null;
-  const speed = Math.min(2, Math.max(0.5, 1 + ratePercent / 100)).toFixed(2);
-  const cacheKey = `${voice}|${speed}|${text}`;
-  if (skTtsCache.has(cacheKey)) return skTtsCache.get(cacheKey);
-
-  try {
-    if (!(await skReserveChars(text.length))) {
-      console.warn(`[SK TTS] 이번 달 한도(${SK_TTS_MONTH_LIMIT}자)에 도달해서 Edge TTS로 대신해요.`);
-      return null;
-    }
-  } catch (e) {
-    console.error('[SK TTS] 사용량 기록 실패 → 안전하게 Edge TTS로 대신해요:', e.message);
-    return null;
-  }
-
-  const res = await fetch('https://apis.openapi.sk.com/axtts/tts', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'audio/wav', appKey: SK_TTS_APP_KEY },
-    body: JSON.stringify({ model: SK_TTS_MODEL, voice, text, speed, sr: 22050, sformat: 'wav', clientId: 'discord-voice-bot' }),
-    signal: AbortSignal.timeout(10_000),
-  });
-  if (!res.ok) throw new Error(`SK TTS HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  const pcm = wavToDiscordPcm(Buffer.from(await res.arrayBuffer()));
-  if (skTtsCache.size >= 100) skTtsCache.delete(skTtsCache.keys().next().value);
-  skTtsCache.set(cacheKey, pcm);
-  return pcm;
-}
-
-async function logSkVoices() {
-  if (!SK_TTS_APP_KEY) return;
-  try {
-    const res = await fetch(`https://apis.openapi.sk.com/axtts/voice?model=${SK_TTS_MODEL}`, {
-      headers: { accept: 'text/plain', appKey: SK_TTS_APP_KEY },
-      signal: AbortSignal.timeout(10_000),
-    });
-    console.log(`[SK TTS] ${SK_TTS_MODEL} 보이스 목록 (HTTP ${res.status}): ${(await res.text()).slice(0, 1500)}`);
-  } catch (e) {
-    console.error('[SK TTS] 보이스 목록 조회 실패:', e.message);
-  }
-}
-
-// ===== 입퇴장 안내(TTS) 재생 큐 =====
-const guildAudio = new Map();
-
-function getGuildAudio(guildId) {
-  if (!guildAudio.has(guildId)) {
-    const player = createAudioPlayer();
-    const state = { player, queue: [], playing: false };
-    guildAudio.set(guildId, state);
-
-    player.on(AudioPlayerStatus.Idle, () => {
-      state.playing = false;
-      if (state.queue.length > 0) {
-        playNext(guildId);
-      } else {
-        scheduleLeave(guildId);
-      }
-    });
-
-    player.on('error', (error) => {
-      console.error(`[안내 음성 재생 오류] 길드 ${guildId}:`, error.message);
-      state.playing = false;
-      if (state.queue.length > 0) {
-        playNext(guildId);
-      } else {
-        scheduleLeave(guildId);
-      }
-    });
-  }
-  return guildAudio.get(guildId);
-}
-
-async function playNext(guildId) {
-  const state = guildAudio.get(guildId);
-  if (!state || state.playing || state.queue.length === 0) return;
-
-  const item = state.queue.shift();
-  state.playing = true;
-  const settings = getSettings(guildId);
-  const voice = item.voice || settings.voice; // /tts에서 목소리를 따로 골랐으면 그걸 우선 사용
-
-  // 1순위: SK A.X TTS (키가 있고 월 한도 안일 때). 실패하면 아래 Edge TTS로 넘어갑니다.
-  try {
-    const pcm = await synthSkTts(item.text, voice, settings.rate);
-    if (pcm) {
-      state.player.play(createAudioResource(Readable.from([pcm]), { inputType: StreamType.Raw }));
-      return;
-    }
-  } catch (error) {
-    console.error('[SK TTS 실패 → Edge TTS로 대신해요]', error.message);
-  }
-
-  try {
-    const tts = new MsEdgeTTS();
-    await tts.setMetadata(voice, OUTPUT_FORMAT.WEBM_24KHZ_16BIT_MONO_OPUS);
-    const { audioStream } = tts.toStream(item.text, { rate: rateToString(settings.rate) });
-
-    // 마이크로소프트 TTS 서버가 응답하지 않거나 오류를 내면, 예전에는 아무 소리 없이 영원히 멈췄습니다.
-    // 이제는 오류/무응답을 로그로 남기고(원인 파악용), 대기열을 풀어서 봇이 정상 상태로 돌아오게 합니다.
-    let gotData = false;
-    let failed = false;
-    const recover = (reason) => {
-      if (failed) return;
-      failed = true;
-      console.error(`[안내 음성 생성 실패] 길드 ${guildId}: ${reason}`);
-      try {
-        audioStream.destroy();
-      } catch {}
-      state.player.stop(true);
-      state.playing = false;
-      if (state.queue.length > 0) {
-        playNext(guildId);
-      } else {
-        scheduleLeave(guildId);
-      }
-    };
-    audioStream.once('data', () => {
-      gotData = true;
-    });
-    audioStream.on('error', (error) => recover(`스트림 오류: ${error && error.message}`));
-    setTimeout(() => {
-      if (!gotData) recover('15초 동안 음성 데이터가 오지 않았어요 (TTS 서버 응답 없음/차단 가능성)');
-    }, 15000);
-
-    const resource = createAudioResource(audioStream, { inputType: StreamType.WebmOpus });
-    state.player.play(resource);
-  } catch (error) {
-    console.error('안내 음성 생성 오류:', error.message);
-    state.playing = false;
-    playNext(guildId);
-  }
-}
-
-async function speak(voiceChannel, text, voice) {
-  const guildId = voiceChannel.guild.id;
-
-  cancelScheduledLeave(guildId);
-
-  let connection = getVoiceConnection(guildId);
-  if (!connection || connection.joinConfig.channelId !== voiceChannel.id) {
-    connection = joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId: guildId,
-      adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-      selfDeaf: false,
-    });
-
-    try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 10_000);
-    } catch (error) {
-      console.error('음성 채널 연결 실패:', error.message);
-      connection.destroy();
-      return;
-    }
-
-    connection.on(VoiceConnectionStatus.Disconnected, () => {
-      cancelScheduledLeave(guildId);
-    });
-  }
-
-  const state = getGuildAudio(guildId);
-  connection.subscribe(state.player);
-  state.queue.push({ text, voice });
-  playNext(guildId);
-}
-
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ 로그인 완료: ${c.user.tag}`);
   alertOps(`✅ 봇 준비 완료: ${c.user.tag}`, 'ready');
-  try {
-    console.log(`[TTS] msedge-tts 버전: ${require('msedge-tts/package.json').version}`);
-  } catch {}
-  logSkVoices();
 
   for (const guild of c.guilds.cache.values()) {
     await registerCommandsForGuild(guild.id);
@@ -1536,7 +1206,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   const guildId = interaction.guildId;
 
   // ===== 설정 명령어 (서버 관리 권한 필요) =====
-  if (['목소리', '속도', '알림채널', '알림채널해제', '챗봇채널', '챗봇채널해제'].includes(interaction.commandName)) {
+  if (['알림채널', '알림채널해제', '챗봇채널', '챗봇채널해제'].includes(interaction.commandName)) {
     if (!member.permissions.has(PermissionFlagsBits.ManageGuild)) {
       await interaction.reply({
         content: '이 명령어는 "서버 관리" 권한이 있는 사람만 사용할 수 있어요.',
@@ -1592,22 +1262,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       settings.chatChannelId = null;
       saveSettings(guildId);
       await interaction.reply({ content: '챗봇 채널 지정을 해제했어요. (/질문 과 @멘션은 계속 쓸 수 있어요)', flags: MessageFlags.Ephemeral });
-    } else if (interaction.commandName === '목소리') {
-      const choice = interaction.options.getString('설정');
-      settings.voice = choice === 'male' ? DEFAULT_VOICE : 'ko-KR-SunHiNeural';
-      saveSettings(guildId);
-      await interaction.reply({
-        content: `목소리를 ${voiceLabel(settings.voice)}로 설정했어요.`,
-        flags: MessageFlags.Ephemeral,
-      });
-    } else {
-      const percent = interaction.options.getInteger('퍼센트');
-      settings.rate = percent;
-      saveSettings(guildId);
-      await interaction.reply({
-        content: `말하기 속도를 ${rateToString(percent)}로 설정했어요.`,
-        flags: MessageFlags.Ephemeral,
-      });
     }
     return;
   }
@@ -1615,29 +1269,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.commandName === '설정확인') {
     const settings = getSettings(guildId);
     await interaction.reply({
-      content: `현재 목소리: ${voiceLabel(settings.voice)}\n현재 속도: ${rateToString(settings.rate)}\n입퇴장 글자 알림: ${settings.logChannelId ? `<#${settings.logChannelId}>` : '각 음성채널 채팅'}`,
+      content: `입퇴장 글자 알림: ${settings.logChannelId ? `<#${settings.logChannelId}>` : '각 음성채널 채팅'}`,
       flags: MessageFlags.Ephemeral,
     });
-    return;
-  }
-
-  // ===== TTS (누구나 사용 가능, 음성 채널에 들어가 있어야 함) =====
-  if (interaction.commandName === 'tts') {
-    const voiceChannel = member.voice.channel;
-    if (!voiceChannel) {
-      await interaction.reply({ content: '먼저 음성 채널에 들어가 있어야 해요.', flags: MessageFlags.Ephemeral });
-      return;
-    }
-
-    const text = interaction.options.getString('내용');
-    const voiceChoice = interaction.options.getString('목소리');
-    const voiceOverride = voiceChoice === 'male' ? DEFAULT_VOICE : voiceChoice === 'female' ? 'ko-KR-SunHiNeural' : undefined;
-
-    speak(voiceChannel, text, voiceOverride);
-    await interaction.reply(
-      `🔊 **${interaction.user.displayName ?? interaction.user.username}**: "${text}"` +
-        (voiceChoice ? ` (${voiceChoice === 'male' ? '남자' : '여자'} 목소리)` : ''),
-    );
     return;
   }
 
@@ -3020,22 +2654,18 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
 
   // 새로운 음성채널 입장
   if (!oldState.channelId && newState.channelId) {
-    speak(newState.channel, `${nickname}님이 입장했습니다`);
     postVoiceLog(newState.channel, `🟢 **${nickname}**님이 입장했습니다`);
     return;
   }
 
   // 음성채널에서 완전히 퇴장
   if (oldState.channelId && !newState.channelId) {
-    speak(oldState.channel, `${nickname}님이 퇴장했습니다`);
     postVoiceLog(oldState.channel, `🔴 **${nickname}**님이 퇴장했습니다`);
     return;
   }
 
   // 다른 음성채널로 이동
   if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId) {
-    speak(oldState.channel, `${nickname}님이 채널을 이동했습니다`);
-    speak(newState.channel, `${nickname}님이 입장했습니다`);
     postVoiceLog(oldState.channel, `🔀 **${nickname}**님이 **${newState.channel.name}** 채널로 이동했습니다`);
     postVoiceLog(newState.channel, `🟢 **${nickname}**님이 입장했습니다 (**${oldState.channel.name}**에서 이동)`);
   }
