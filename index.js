@@ -146,13 +146,14 @@ async function fetchImageWithRetries(url, maxAttempts = 3, timeoutMs = 45000) {
 }
 
 // ===== 삼행시 =====
-// 무료 텍스트 AI(Pollinations, API 키 불필요)에게 제시어의 글자마다 한 줄씩 짓게 합니다.
+// Gemini에게 제시어의 글자마다 한 줄씩 짓게 합니다. (키가 없거나 Gemini가 실패하면 무료 Pollinations로 대체)
 // 각 줄이 정확히 그 글자로 시작하는지 검사하고, 아니면 한 번 더 시도합니다.
 function parseAcrostic(text, chars) {
   const lines = String(text)
     .split('\n')
     .map((line) =>
       line
+        .replace(/[*_~`]/g, '') // Gemini가 "**디**스코드"처럼 굵게 쓰는 마크다운 기호 제거
         .replace(/^[\s\-*•\d.)]+/, '')
         .replace(/^[^가-힣]{0,3}(?=[가-힣])/, '')
         .replace(/^[가-힣]\s*[:：]\s*/, '') // "디: 디자인이" 같은 라벨 표기는 라벨만 제거
@@ -164,12 +165,45 @@ function parseAcrostic(text, chars) {
   return picked.every((line, i) => line.startsWith(chars[i])) ? picked : null;
 }
 
-async function makeAcrostic(word) {
+const ACROSTIC_SYSTEM_PROMPT =
+  '너는 재치 있는 한국어 삼행시 작가야. 요청받은 행시만 줄바꿈으로 구분해서 출력하고, 제목·설명·번호·따옴표는 절대 쓰지 마.';
+
+function acrosticPrompt(word) {
   const chars = [...word];
-  const prompt =
+  return (
     `제시어 "${word}"로 한국어 ${chars.length}행시를 지어줘. ` +
     `각 줄은 순서대로 ${chars.map((c) => `"${c}"`).join(', ')}(으)로 시작해야 하고, ` +
-    `재치 있고 짧은 한 문장씩, 총 ${chars.length}줄만 출력해. 설명이나 제목, 번호는 쓰지 마.`;
+    `재치 있고 짧은 한 문장씩, 총 ${chars.length}줄만 출력해. 설명이나 제목, 번호는 쓰지 마.`
+  );
+}
+
+async function makeAcrostic(word) {
+  const chars = [...word];
+  let fallbackLines = null;
+  if (GEMINI_API_KEY) {
+    for (let round = 0; round < 2; round++) {
+      try {
+        const text = await askGemini([], acrosticPrompt(word), ACROSTIC_SYSTEM_PROMPT, 1.0);
+        const parsed = parseAcrostic(text, chars);
+        if (parsed) return { lines: parsed, exact: true };
+        console.error('삼행시 형식 불일치 (Gemini) 응답:', text.slice(0, 200));
+        const loose = text.split('\n').map((l) => l.trim()).filter(Boolean);
+        if (loose.length >= chars.length && !fallbackLines) fallbackLines = loose.slice(0, chars.length);
+      } catch (error) {
+        console.error('삼행시 Gemini 오류:', error.message);
+        break; // askGemini가 이미 재시도와 예비 모델까지 해 봤으므로 Pollinations로 넘어갑니다.
+      }
+    }
+  }
+  const result = await makeAcrosticPollinations(word);
+  if (result && result.exact) return result;
+  if (fallbackLines) return { lines: fallbackLines, exact: false };
+  return result;
+}
+
+async function makeAcrosticPollinations(word) {
+  const chars = [...word];
+  const prompt = acrosticPrompt(word);
 
   // 서로 다른 두 가지 주소를 번갈아 시도합니다 (한쪽이 막히거나 바뀌어도 다른 쪽으로 동작하게).
   const attempts = [
@@ -2006,7 +2040,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     try {
       const result = await makeAcrostic(word);
       if (!result) {
-        await interaction.editReply('삼행시 서버(Pollinations)가 응답하지 않아요. 무료 서버라 가끔 이래요 — 잠시 후 다시 시도해주세요.');
+        await interaction.editReply('AI가 지금 바빠서 삼행시를 못 지었어요. 잠시 후 다시 시도해주세요.');
         return;
       }
       const lines = result.lines;
