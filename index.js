@@ -1101,6 +1101,18 @@ const commands = [
     .addStringOption((option) => option.setName('번호').setDescription('/리마인더목록에 나온 번호').setRequired(true)),
 ].map((command) => command.toJSON());
 
+// ===== 레벨링 · 랭킹 · 출석 · 포인트 상점 (leaderboard/ 폴더) =====
+// 저장소(Upstash Redis)가 설정돼 있을 때만 켜져요. 없으면 이 기능만 꺼지고 나머지는 그대로 돌아가요.
+let LB = null;
+if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+  try {
+    LB = require('./leaderboard');
+    commands.push(...LB.data);
+  } catch (error) {
+    console.error('레벨링 모듈을 불러오지 못했어요 (이 기능만 꺼져요):', error.message);
+  }
+}
+
 async function registerCommandsForGuild(guildId) {
   const rest = new REST().setToken(process.env.DISCORD_TOKEN);
   try {
@@ -1120,6 +1132,7 @@ client.once(Events.ClientReady, async (c) => {
     await registerCommandsForGuild(guild.id);
   }
   console.log('✅ 슬래시 명령어 등록 완료');
+  if (LB) LB.start(c);
 
   if (dbEnabled) {
     for (const guild of c.guilds.cache.values()) {
@@ -1188,6 +1201,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
           `서버가 잠들어있다가 늦게 깨어났을 가능성이 높아요 (Render 무료 플랜의 콜드 스타트).`,
       );
     }
+  }
+
+  if (LB && interaction.isChatInputCommand() && LB.handlers[interaction.commandName]) {
+    await LB.runSlash(interaction);
+    return;
   }
 
   if (interaction.isButton() && interaction.customId.startsWith('rps_')) {
@@ -2543,6 +2561,9 @@ async function aiWordChainTurn(game) {
 // 끝말잇기 진행 중인 채널의 일반 채팅 메시지를 감시합니다.
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
+
+  // 레벨링: 채팅 XP를 주고, !상점 같은 글자 명령어면 거기서 처리를 끝냅니다.
+  if (LB && (await LB.onMessage(message))) return;
 
   // 챗봇: 지정된 채팅 채널의 모든 글, 또는 어느 채널이든 봇을 @멘션한 글에 AI가 대답합니다.
   // (끝말잇기가 진행 중인 채널에서는 끝말잇기가 우선입니다.)
