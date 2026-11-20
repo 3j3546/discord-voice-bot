@@ -885,7 +885,8 @@ async function streamJson(url) {
 
 // --- 치지직 ---
 async function chzzkInfo(id) {
-  const { json } = await streamJson(`https://api.chzzk.naver.com/service/v1/channels/${id}`);
+  const { status, json } = await streamJson(`https://api.chzzk.naver.com/service/v1/channels/${id}`);
+  if (status >= 400 && status !== 404) throw new Error(`치지직 서버가 접속을 거절했어요 (HTTP ${status})`);
   const c = json && json.content;
   if (!c || !c.channelId) return null; // 없는 채널은 channelId가 null로 와요
   return { name: c.channelName || id, live: Boolean(c.openLive) };
@@ -901,7 +902,8 @@ async function chzzkLive(id) {
 
 // --- SOOP ---
 async function soopFetch(id) {
-  const { json } = await streamJson(`https://chapi.sooplive.co.kr/api/${encodeURIComponent(id)}/station`);
+  const { status, json } = await streamJson(`https://chapi.sooplive.co.kr/api/${encodeURIComponent(id)}/station`);
+  if (status >= 400 && status !== 404) throw new Error(`SOOP 서버가 접속을 거절했어요 (HTTP ${status})`);
   if (!json || !json.station || !json.station.user_id) return null;
   const broad = json.broad;
   return {
@@ -967,15 +969,18 @@ async function youtubeResolve(input) {
   let url = null;
   if (direct) url = `https://www.youtube.com/channel/${direct[1]}`;
   else {
-    const h = text.match(/@([\w.\-%]+)/);
+    const h = text.match(/@([\p{L}\p{N}_.\-%]+)/u);
     if (h) url = `https://www.youtube.com/@${h[1]}`;
   }
   if (!url) return null;
   const res = await fetchWithTimeout(url, { headers: { 'User-Agent': BROWSER_UA, 'Accept-Language': 'ko-KR,ko;q=0.9', Cookie: 'CONSENT=YES+1; SOCS=CAI' } }, 12000);
-  if (!res.ok) return null;
+  if (!res.ok) {
+    if (res.status === 404) return null;
+    throw new Error(`유튜브 서버가 접속을 거절했어요 (HTTP ${res.status})`);
+  }
   const html = (await res.text()).slice(0, 2_000_000);
   const canon = html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/channel\/(UC[\w-]{22})"/) || html.match(/"channelId":"(UC[\w-]{22})"/);
-  if (!canon) return null;
+  if (!canon) throw new Error('유튜브가 채널 페이지 대신 다른 페이지(동의/차단 화면)를 보여줬어요. 채널 주소를 `youtube.com/channel/UC...` 형태로 넣어보세요');
   const t = html.match(/<meta property="og:title" content="([^"]*)"/);
   return { id: canon[1], name: t ? decodeHtml(t[1]) : canon[1] };
 }
@@ -991,7 +996,7 @@ async function resolveStreamer(platform, input) {
     return info && { id, name: info.name, live: info.live };
   }
   if (platform === 'soop') {
-    const m = text.match(/(?:sooplive\.co\.kr|afreecatv\.com)\/(?:station\/)?([A-Za-z0-9_]{2,20})/) || text.match(/^@?([A-Za-z0-9_]{2,20})$/);
+    const m = text.match(/(?:sooplive\.(?:co\.kr|com)|afreecatv\.com)\/(?:station\/)?@?([A-Za-z0-9_]{2,20})/) || text.match(/^@?([A-Za-z0-9_]{2,20})$/);
     if (!m) return null;
     const id = m[1].toLowerCase();
     const info = await soopFetch(id);
@@ -1135,7 +1140,15 @@ async function handleStreamCommand(interaction) {
         }
       }
 
-      const found = await resolveStreamer(platform, input);
+      let found = null;
+      try {
+        found = await resolveStreamer(platform, input);
+      } catch (e) {
+        console.error(`방송 채널 확인 실패(${platform}):`, e.message);
+        await interaction.editReply(`${STREAM_PLATFORMS[platform].label} 서버에 연결하지 못했어요. (${e.message}) 잠시 후 다시 시도해주세요.`);
+        return;
+      }
+      if (!found) console.error(`방송 채널을 찾지 못함(${platform}): 입력=${String(input).slice(0, 80)}`);
       if (!found) {
         const hint = {
           chzzk: '치지직 채널 주소(`https://chzzk.naver.com/채널ID`)나 32자리 채널 ID를 넣어주세요.',
