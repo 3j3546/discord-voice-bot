@@ -825,6 +825,424 @@ async function checkReminders() {
 }
 
 
+// ===== 방송 시작 알림 (치지직 · SOOP · 유튜브) =====
+// 등록한 방송 채널이 켜지면 서버 채널이나 DM으로 알려줘요. (API 키 필요 없음)
+// DB에는 "누가 어디로 받을지" 구독 정보만 저장해요 (리마인더와 같은 DB, 키 이름 `streams`).
+// - 구독 목록은 봇이 켜질 때 한 번만 읽어서 메모리에 들고 있고, 2분마다 방송 상태를 확인할 때는 DB를 쓰지 않아요.
+// - 방송 상태(켜졌는지)나 알림 기록은 저장하지 않아요. (알림을 보낸 기록은 남기지 않으므로 DB 용량이 늘어나지 않아요)
+// - 봇이 꺼져 있는 동안 시작한 방송은 알려주지 못해요. 켜졌을 때 이미 방송 중이던 건 알림 없이 "방송 중"으로만 기억해요.
+const STREAM_PLATFORMS = {
+  chzzk: { label: '치지직', color: 0x00ffa3 },
+  soop: { label: 'SOOP', color: 0x1b6bff },
+  youtube: { label: 'YouTube', color: 0xff0000 },
+};
+const STREAM_POLL_MS = 2 * 60 * 1000;
+const MAX_STREAMERS = 60; // 봇 전체에서 동시에 확인하는 방송 채널 수
+const MAX_YOUTUBE_STREAMERS = 15; // 유튜브는 페이지를 읽어서 확인하므로 따로 제한
+const MAX_CHANNEL_SUBS_PER_GUILD = 10;
+const MAX_DM_SUBS_PER_USER = 5;
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
+
+const streamSubs = new Map(); // "platform:id" -> { n: 표시이름, s: [ { i, k:'c'|'d', g, u, c?, r? } ] }
+const streamState = new Map(); // "platform:id" -> { live, off, vid } (메모리에만 있어요)
+let streamsLoaded = false;
+
+async function loadStreams() {
+  const all = hashToObject(await redis('HGETALL', 'streams'));
+  for (const [key, raw] of Object.entries(all)) {
+    try {
+      const entry = JSON.parse(raw);
+      if (entry && Array.isArray(entry.s) && entry.s.length) streamSubs.set(key, entry);
+    } catch (e) {
+      // 깨진 항목은 무시
+    }
+  }
+  streamsLoaded = true;
+}
+
+async function saveStream(key) {
+  const entry = streamSubs.get(key);
+  if (entry && entry.s.length) {
+    await redis('HSET', 'streams', key, JSON.stringify(entry));
+  } else {
+    streamSubs.delete(key);
+    streamState.delete(key);
+    await redis('HDEL', 'streams', key);
+  }
+}
+
+function streamUrl(platform, id, vid) {
+  if (platform === 'chzzk') return `https://chzzk.naver.com/live/${id}`;
+  if (platform === 'soop') return `https://play.sooplive.co.kr/${id}`;
+  return vid ? `https://www.youtube.com/watch?v=${vid}` : `https://www.youtube.com/channel/${id}/live`;
+}
+
+async function streamJson(url) {
+  const r = await fetchWithTimeout(url, { headers: { 'User-Agent': BROWSER_UA, Accept: 'application/json' } }, 8000);
+  const json = await r.json().catch(() => null);
+  return { status: r.status, json };
+}
+
+// --- 치지직 ---
+async function chzzkInfo(id) {
+  const { json } = await streamJson(`https://api.chzzk.naver.com/service/v1/channels/${id}`);
+  const c = json && json.content;
+  if (!c || !c.channelId) return null; // 없는 채널은 channelId가 null로 와요
+  return { name: c.channelName || id, live: Boolean(c.openLive) };
+}
+async function chzzkLive(id) {
+  const { json } = await streamJson(`https://api.chzzk.naver.com/polling/v2/channels/${id}/live-status`);
+  if (json && json.code === 200 && json.content) {
+    return { live: json.content.status === 'OPEN', title: json.content.liveTitle || '' };
+  }
+  const info = await chzzkInfo(id); // 대체: 채널 정보의 openLive
+  return info ? { live: info.live, title: '' } : null;
+}
+
+// --- SOOP ---
+async function soopFetch(id) {
+  const { json } = await streamJson(`https://chapi.sooplive.co.kr/api/${encodeURIComponent(id)}/station`);
+  if (!json || !json.station || !json.station.user_id) return null;
+  const broad = json.broad;
+  return {
+    name: json.station.user_nick || json.station.user_id,
+    live: Boolean(broad),
+    title: (broad && (broad.broad_title || broad.title)) || '',
+  };
+}
+
+// --- 유튜브 ---
+// /live 페이지 앞부분만 읽어요. 방송 중이 아니면 canonical 링크가 채널 주소라서 거기서 바로 끊고,
+// 방송 중이면 watch 주소라서 "isLive":true를 찾을 때까지 더 읽어요.
+async function youtubeLive(channelId) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch(`https://www.youtube.com/channel/${channelId}/live`, {
+      headers: { 'User-Agent': BROWSER_UA, 'Accept-Language': 'ko-KR,ko;q=0.9', Cookie: 'CONSENT=YES+1; SOCS=CAI' },
+      signal: controller.signal,
+    });
+    if (!res.ok || !res.body) return null;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let canonical = null;
+    while (buf.length < 3_000_000) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      if (canonical === null) {
+        const m = buf.match(/<link rel="canonical" href="([^"]+)"/);
+        if (m) {
+          canonical = m[1];
+          if (!/watch\?v=/.test(canonical)) return { live: false };
+        }
+      }
+      if (canonical && buf.includes('"isLive":true')) {
+        const vid = (canonical.match(/watch\?v=([\w-]{11})/) || [])[1] || null;
+        const t = buf.match(/<meta property="og:title" content="([^"]*)"/);
+        return { live: true, vid, title: t ? decodeHtml(t[1]) : '' };
+      }
+    }
+    if (canonical === null) return null; // 동의 페이지 등으로 읽지 못함 → 모름
+    return { live: false };
+  } catch (e) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+  }
+}
+function decodeHtml(s) {
+  return String(s)
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
+}
+async function youtubeResolve(input) {
+  const text = input.trim();
+  const direct = text.match(/(UC[\w-]{22})/);
+  let url = null;
+  if (direct) url = `https://www.youtube.com/channel/${direct[1]}`;
+  else {
+    const h = text.match(/@([\w.\-%]+)/);
+    if (h) url = `https://www.youtube.com/@${h[1]}`;
+  }
+  if (!url) return null;
+  const res = await fetchWithTimeout(url, { headers: { 'User-Agent': BROWSER_UA, 'Accept-Language': 'ko-KR,ko;q=0.9', Cookie: 'CONSENT=YES+1; SOCS=CAI' } }, 12000);
+  if (!res.ok) return null;
+  const html = (await res.text()).slice(0, 2_000_000);
+  const canon = html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/channel\/(UC[\w-]{22})"/) || html.match(/"channelId":"(UC[\w-]{22})"/);
+  if (!canon) return null;
+  const t = html.match(/<meta property="og:title" content="([^"]*)"/);
+  return { id: canon[1], name: t ? decodeHtml(t[1]) : canon[1] };
+}
+
+// 입력(주소/ID)에서 채널 ID를 뽑아 실제로 있는 채널인지 확인하고 { id, name, live } 를 돌려줘요. 못 찾으면 null.
+async function resolveStreamer(platform, input) {
+  const text = input.trim();
+  if (platform === 'chzzk') {
+    const m = text.match(/\b([0-9a-f]{32})\b/i);
+    if (!m) return null;
+    const id = m[1].toLowerCase();
+    const info = await chzzkInfo(id);
+    return info && { id, name: info.name, live: info.live };
+  }
+  if (platform === 'soop') {
+    const m = text.match(/(?:sooplive\.co\.kr|afreecatv\.com)\/(?:station\/)?([A-Za-z0-9_]{2,20})/) || text.match(/^@?([A-Za-z0-9_]{2,20})$/);
+    if (!m) return null;
+    const id = m[1].toLowerCase();
+    const info = await soopFetch(id);
+    return info && { id, name: info.name, live: info.live };
+  }
+  const yt = await youtubeResolve(text);
+  if (!yt) return null;
+  const st = await youtubeLive(yt.id);
+  return { id: yt.id, name: yt.name, live: st ? st.live : false };
+}
+
+async function fetchStreamStatus(platform, id) {
+  try {
+    if (platform === 'chzzk') return await chzzkLive(id);
+    if (platform === 'soop') return await soopFetch(id);
+    return await youtubeLive(id);
+  } catch (e) {
+    return null; // 일시적 오류는 "모름"으로 보고 상태를 바꾸지 않아요
+  }
+}
+
+async function notifyStream(key, status) {
+  const entry = streamSubs.get(key);
+  if (!entry) return;
+  const sep = key.indexOf(':');
+  const platform = key.slice(0, sep);
+  const id = key.slice(sep + 1);
+  const meta = STREAM_PLATFORMS[platform];
+  const embed = new EmbedBuilder()
+    .setColor(meta.color)
+    .setTitle(`🔴 ${entry.n} 방송 시작!`)
+    .setURL(streamUrl(platform, id, status.vid))
+    .setDescription(status.title ? `**${status.title}**\n지금 바로 보러 가기 👉 ${streamUrl(platform, id, status.vid)}` : `지금 바로 보러 가기 👉 ${streamUrl(platform, id, status.vid)}`)
+    .setFooter({ text: meta.label })
+    .setTimestamp();
+  let removedAny = false;
+  for (const sub of [...entry.s]) {
+    try {
+      if (sub.k === 'c') {
+        const channel = await client.channels.fetch(sub.c);
+        await channel.send({
+          content: sub.r ? `<@&${sub.r}>` : undefined,
+          embeds: [embed],
+          allowedMentions: { roles: sub.r ? [sub.r] : [] },
+        });
+      } else {
+        const user = await client.users.fetch(sub.u);
+        await user.send({ embeds: [embed] });
+      }
+    } catch (error) {
+      console.error(`방송 알림 전송 실패(${key}, ${sub.k}):`, error.message);
+      // 채널이 사라졌거나 봇이 쫓겨난 경우만 구독을 정리해요 (DM이 막힌 건 사용자가 풀 수도 있어서 그대로 둬요)
+      if (sub.k === 'c' && [10003, 50001].includes(error.code)) {
+        entry.s = entry.s.filter((x) => x.i !== sub.i);
+        removedAny = true;
+      }
+    }
+  }
+  if (removedAny) await saveStream(key).catch((e) => console.error(e.message));
+}
+
+async function processStream(key) {
+  const sep = key.indexOf(':');
+  const status = await fetchStreamStatus(key.slice(0, sep), key.slice(sep + 1));
+  if (!status) return;
+  const state = streamState.get(key);
+  if (!state) {
+    // 처음 보는 상태: 이미 방송 중이어도 알리지 않고 기억만 해요
+    streamState.set(key, { live: status.live, off: 0, vid: status.vid || null });
+    return;
+  }
+  if (status.live) {
+    const isNew = !state.live || (status.vid && state.vid && status.vid !== state.vid);
+    state.live = true;
+    state.off = 0;
+    state.vid = status.vid || state.vid;
+    if (isNew) await notifyStream(key, status);
+  } else if (state.live) {
+    // 잠깐 끊겼다 이어지는 방송에서 알림이 두 번 가지 않게, 2번 연속(약 4분) 꺼져 있어야 "방송 끝"으로 봐요
+    state.off += 1;
+    if (state.off >= 2) {
+      state.live = false;
+      state.off = 0;
+      state.vid = null;
+    }
+  }
+}
+
+let streamCheckRunning = false;
+async function checkStreams() {
+  if (!dbEnabled || !streamsLoaded || !client.isReady() || streamCheckRunning) return;
+  streamCheckRunning = true;
+  try {
+    const keys = [...streamSubs.keys()];
+    for (let i = 0; i < keys.length; i += 4) {
+      await Promise.all(keys.slice(i, i + 4).map((k) => processStream(k).catch((e) => console.error('방송 확인 오류:', e.message))));
+    }
+  } finally {
+    streamCheckRunning = false;
+  }
+}
+
+function streamSubLines(entries) {
+  return entries.map(({ key, sub, name }) => {
+    const [platform] = key.split(':');
+    const where = sub.k === 'c' ? `<#${sub.c}>${sub.r ? ` (<@&${sub.r}> 멘션)` : ''}` : 'DM';
+    return `\`${sub.i}\` ${STREAM_PLATFORMS[platform].label} · **${name}** → ${where}`;
+  });
+}
+
+async function handleStreamCommand(interaction) {
+  const guildId = interaction.guildId;
+  const userId = interaction.user.id;
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  try {
+    if (!streamsLoaded) {
+      await interaction.editReply('아직 방송 알림 정보를 불러오는 중이에요. 잠시 후 다시 시도해주세요.');
+      return;
+    }
+    const name = interaction.commandName;
+
+    if (name === '방송알림추가') {
+      const platform = interaction.options.getString('플랫폼');
+      const input = interaction.options.getString('주소');
+      const where = interaction.options.getString('보낼곳') || 'channel';
+      const picked = interaction.options.getChannel('채널');
+      const role = interaction.options.getRole('역할');
+
+      let targetChannel = null;
+      if (where === 'channel') {
+        if (!interaction.memberPermissions || !interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild)) {
+          await interaction.editReply('서버 채널로 받는 알림은 "서버 관리" 권한이 있는 사람만 등록할 수 있어요. 내 DM으로 받으려면 `보낼곳`을 **내 DM**으로 골라주세요.');
+          return;
+        }
+        targetChannel = picked || interaction.channel;
+        const me = interaction.guild.members.me;
+        const perms = me && targetChannel.permissionsFor(me);
+        if (!perms || !perms.has(PermissionFlagsBits.ViewChannel) || !perms.has(PermissionFlagsBits.SendMessages) || !perms.has(PermissionFlagsBits.EmbedLinks)) {
+          await interaction.editReply(`봇이 <#${targetChannel.id}> 채널에서 글을 쓸 수 없어요. "채널 보기", "메시지 보내기", "링크 첨부" 권한을 준 뒤 다시 시도해주세요.`);
+          return;
+        }
+      }
+
+      const found = await resolveStreamer(platform, input);
+      if (!found) {
+        const hint = {
+          chzzk: '치지직 채널 주소(`https://chzzk.naver.com/채널ID`)나 32자리 채널 ID를 넣어주세요.',
+          soop: 'SOOP 방송국 주소(`https://ch.sooplive.co.kr/아이디`)나 아이디를 넣어주세요.',
+          youtube: '유튜브 채널 주소(`youtube.com/@핸들` 또는 `youtube.com/channel/UC...`)나 `@핸들`을 넣어주세요.',
+        }[platform];
+        await interaction.editReply(`채널을 찾지 못했어요. ${hint}`);
+        return;
+      }
+
+      const key = `${platform}:${found.id}`;
+      let entry = streamSubs.get(key);
+      if (!entry) {
+        if (streamSubs.size >= MAX_STREAMERS) {
+          await interaction.editReply(`봇 전체에서 확인할 수 있는 방송 채널 수(${MAX_STREAMERS}개)가 가득 찼어요.`);
+          return;
+        }
+        if (platform === 'youtube' && [...streamSubs.keys()].filter((k) => k.startsWith('youtube:')).length >= MAX_YOUTUBE_STREAMERS) {
+          await interaction.editReply(`유튜브 채널은 봇 전체에서 최대 ${MAX_YOUTUBE_STREAMERS}개까지만 확인할 수 있어요.`);
+          return;
+        }
+        entry = { n: found.name, s: [] };
+      }
+
+      const all = [...streamSubs.entries()].flatMap(([, e]) => e.s);
+      if (where === 'channel') {
+        if (all.filter((s) => s.k === 'c' && s.g === guildId).length >= MAX_CHANNEL_SUBS_PER_GUILD) {
+          await interaction.editReply(`이 서버에는 방송 알림을 ${MAX_CHANNEL_SUBS_PER_GUILD}개까지 등록할 수 있어요. \`/방송알림삭제\`로 정리해주세요.`);
+          return;
+        }
+        if (entry.s.some((s) => s.k === 'c' && s.c === targetChannel.id)) {
+          await interaction.editReply('이미 이 채널로 같은 방송 알림이 등록돼 있어요.');
+          return;
+        }
+      } else {
+        if (all.filter((s) => s.k === 'd' && s.u === userId).length >= MAX_DM_SUBS_PER_USER) {
+          await interaction.editReply(`DM 알림은 한 사람당 ${MAX_DM_SUBS_PER_USER}개까지예요. \`/방송알림삭제\`로 정리해주세요.`);
+          return;
+        }
+        if (entry.s.some((s) => s.k === 'd' && s.u === userId)) {
+          await interaction.editReply('이미 이 방송은 내 DM으로 받고 있어요.');
+          return;
+        }
+      }
+
+      const id = Math.random().toString(36).slice(2, 7);
+      const sub = where === 'channel' ? { i: id, k: 'c', g: guildId, u: userId, c: targetChannel.id } : { i: id, k: 'd', g: guildId, u: userId };
+      if (where === 'channel' && role) sub.r = role.id;
+      entry.n = found.name;
+      entry.s.push(sub);
+      streamSubs.set(key, entry);
+      try {
+        await saveStream(key);
+      } catch (e) {
+        entry.s = entry.s.filter((s) => s.i !== id);
+        if (!entry.s.length) streamSubs.delete(key);
+        throw e;
+      }
+      if (!streamState.has(key)) streamState.set(key, { live: found.live, off: 0, vid: null });
+
+      const dest = where === 'channel' ? `<#${targetChannel.id}> 채널` : '내 DM';
+      let msg = `✅ ${STREAM_PLATFORMS[platform].label} **${found.name}** 님의 방송 시작을 ${dest}로 알려드릴게요. (번호 \`${id}\`)`;
+      if (where === 'dm') msg += '\n※ 디스코드 설정에서 "서버 멤버가 보내는 개인 메시지 허용"이 꺼져 있으면 DM이 오지 않아요.';
+      if (found.live) msg += '\n지금 이미 방송 중이라 이번에는 알림이 가지 않고, 다음 방송부터 알려드려요.';
+      msg += `\n확인 주기는 약 ${STREAM_POLL_MS / 60000}분이라 알림이 조금 늦을 수 있어요.`;
+      await interaction.editReply(msg);
+      return;
+    }
+
+    if (name === '방송알림목록') {
+      const rows = [];
+      for (const [key, entry] of streamSubs) {
+        for (const sub of entry.s) {
+          if ((sub.k === 'c' && sub.g === guildId) || (sub.k === 'd' && sub.u === userId)) rows.push({ key, sub, name: entry.n });
+        }
+      }
+      if (!rows.length) {
+        await interaction.editReply('등록된 방송 알림이 없어요. `/방송알림추가`로 등록해보세요.');
+        return;
+      }
+      await interaction.editReply(`📺 **방송 알림 (이 서버의 채널 알림 + 내 DM 알림)**\n${streamSubLines(rows).join('\n')}`);
+      return;
+    }
+
+    if (name === '방송알림삭제') {
+      const id = interaction.options.getString('번호').trim();
+      const canManage = interaction.memberPermissions && interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild);
+      for (const [key, entry] of streamSubs) {
+        const sub = entry.s.find((s) => s.i === id);
+        if (!sub) continue;
+        const mine = sub.u === userId && (sub.k === 'd' || sub.g === guildId);
+        const adminOfThis = sub.k === 'c' && sub.g === guildId && canManage;
+        if (!mine && !adminOfThis) break;
+        entry.s = entry.s.filter((s) => s.i !== id);
+        await saveStream(key);
+        await interaction.editReply(`🗑️ **${entry.n}** 방송 알림 \`${id}\`를 삭제했어요.`);
+        return;
+      }
+      await interaction.editReply('그 번호의 방송 알림을 찾지 못했거나 삭제할 권한이 없어요. `/방송알림목록`에서 번호를 확인해주세요.');
+    }
+  } catch (error) {
+    console.error('방송 알림 처리 오류:', error.stack || error);
+    await interaction.editReply('처리 중 오류가 발생했어요. 잠시 후 다시 시도해주세요.').catch(() => {});
+  }
+}
+
+
 // DeepL 번역 API를 이용한 번역.
 // DEEPL_API_KEY 환경변수가 필요합니다 (deepl.com에서 무료 가입, 신용카드 불필요,
 // 한 달에 500,000자까지 무료). source를 안 주면 한국어 포함 여부로 자동 추정합니다.
@@ -1099,19 +1517,36 @@ const commands = [
     .setName('리마인더삭제')
     .setDescription('내 리마인더를 취소합니다')
     .addStringOption((option) => option.setName('번호').setDescription('/리마인더목록에 나온 번호').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('방송알림추가')
+    .setDescription('치지직·SOOP·유튜브 방송이 시작되면 알려드려요')
+    .addStringOption((option) =>
+      option
+        .setName('플랫폼')
+        .setDescription('방송 플랫폼')
+        .setRequired(true)
+        .addChoices({ name: '치지직', value: 'chzzk' }, { name: 'SOOP(숲)', value: 'soop' }, { name: '유튜브', value: 'youtube' }),
+    )
+    .addStringOption((option) => option.setName('주소').setDescription('채널 주소나 ID (유튜브는 @핸들도 가능)').setRequired(true))
+    .addStringOption((option) =>
+      option
+        .setName('보낼곳')
+        .setDescription('알림을 받을 곳 (기본: 서버 채널, 서버 관리 권한 필요)')
+        .addChoices({ name: '서버 채널', value: 'channel' }, { name: '내 DM', value: 'dm' }),
+    )
+    .addChannelOption((option) =>
+      option
+        .setName('채널')
+        .setDescription('서버 채널로 받을 때 알림을 올릴 채널 (안 고르면 지금 채널)')
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
+    )
+    .addRoleOption((option) => option.setName('역할').setDescription('서버 채널 알림에 멘션할 역할 (선택)')),
+  new SlashCommandBuilder().setName('방송알림목록').setDescription('이 서버의 방송 알림과 내 DM 방송 알림을 보여줍니다'),
+  new SlashCommandBuilder()
+    .setName('방송알림삭제')
+    .setDescription('방송 알림을 삭제합니다')
+    .addStringOption((option) => option.setName('번호').setDescription('/방송알림목록에 나온 번호').setRequired(true)),
 ].map((command) => command.toJSON());
-
-// ===== 레벨링 · 랭킹 · 출석 · 포인트 상점 (leaderboard/ 폴더) =====
-// 저장소(Upstash Redis)가 설정돼 있을 때만 켜져요. 없으면 이 기능만 꺼지고 나머지는 그대로 돌아가요.
-let LB = null;
-if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
-  try {
-    LB = require('./leaderboard');
-    commands.push(...LB.data);
-  } catch (error) {
-    console.error('레벨링 모듈을 불러오지 못했어요 (이 기능만 꺼져요):', error.message);
-  }
-}
 
 async function registerCommandsForGuild(guildId) {
   const rest = new REST().setToken(process.env.DISCORD_TOKEN);
@@ -1132,7 +1567,6 @@ client.once(Events.ClientReady, async (c) => {
     await registerCommandsForGuild(guild.id);
   }
   console.log('✅ 슬래시 명령어 등록 완료');
-  if (LB) LB.start(c);
 
   if (dbEnabled) {
     for (const guild of c.guilds.cache.values()) {
@@ -1141,6 +1575,13 @@ client.once(Events.ClientReady, async (c) => {
     console.log('🗄️ DB(Upstash Redis) 연결됨: 저장된 서버 설정을 불러왔어요.');
     setInterval(() => checkReminders().catch((e) => console.error(e.message)), 60 * 1000);
     setInterval(() => checkBirthdays().catch((e) => console.error(e.message)), 60 * 1000);
+    loadStreams()
+      .then(() => {
+        console.log(`📺 방송 알림 구독 ${streamSubs.size}개 채널을 불러왔어요.`);
+        setInterval(() => checkStreams().catch((e) => console.error(e.message)), STREAM_POLL_MS);
+        setTimeout(() => checkStreams().catch((e) => console.error(e.message)), 10000);
+      })
+      .catch((e) => console.error('방송 알림 구독을 불러오지 못했어요:', e.message));
     setTimeout(() => {
       checkReminders().catch((e) => console.error(e.message));
       checkBirthdays().catch((e) => console.error(e.message));
@@ -1203,10 +1644,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   }
 
-  if (LB && interaction.isChatInputCommand() && LB.handlers[interaction.commandName]) {
-    await LB.runSlash(interaction);
-    return;
-  }
 
   if (interaction.isButton() && interaction.customId.startsWith('rps_')) {
     if (!interaction.inGuild()) return;
@@ -1848,6 +2285,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.error('DB 기능 처리 오류:', error.stack || error);
       await interaction.editReply('처리 중 오류가 발생했어요. DB 연결 상태를 확인하거나 잠시 후 다시 시도해주세요.');
     }
+    return;
+  }
+
+  // ===== 방송 시작 알림 (DB 필요) =====
+  if (['방송알림추가', '방송알림목록', '방송알림삭제'].includes(interaction.commandName)) {
+    if (!dbEnabled) {
+      await interaction.reply({
+        content: '이 기능은 DB 설정이 필요해요. 봇 관리자가 Render 환경변수에 `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`을 등록해야 해요.',
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    await handleStreamCommand(interaction);
     return;
   }
 
@@ -2562,8 +3012,6 @@ async function aiWordChainTurn(game) {
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
 
-  // 레벨링: 채팅 XP를 주고, !상점 같은 글자 명령어면 거기서 처리를 끝냅니다.
-  if (LB && (await LB.onMessage(message))) return;
 
   // 챗봇: 지정된 채팅 채널의 모든 글, 또는 어느 채널이든 봇을 @멘션한 글에 AI가 대답합니다.
   // (끝말잇기가 진행 중인 채널에서는 끝말잇기가 우선입니다.)
