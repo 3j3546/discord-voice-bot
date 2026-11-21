@@ -1597,7 +1597,9 @@ async function messageCommand(message) {
   const action = (text.match(/(타임아웃|차단|밴|추방|킥|경고)/) || [])[1];
   const release = /해제|풀어|풀기|취소/.test(text);
   if (!action) return false;
-  const targetUser = message.mentions.users.find((u) => u.id !== client.user.id);
+  // 글 안에 실제로 적힌 멘션 중 첫 번째 (답장 기능으로 자동 추가되는 멘션은 제외)
+  const mentionedIds = [...message.content.matchAll(/<@!?(\d+)>/g)].map((m) => m[1]).filter((id) => id !== client.user.id);
+  const targetUser = mentionedIds.length ? message.mentions.users.get(mentionedIds[0]) : null;
   if (!targetUser) return false;
 
   const guild = message.guild;
@@ -1646,8 +1648,15 @@ async function messageCommand(message) {
       if (!targetMember) return (await reply('서버에 없는 유저는 타임아웃할 수 없어요.'), true);
       const applied = Math.min(ms, MAX_TIMEOUT_MS);
       await targetMember.timeout(applied, reason);
+      // 디스코드가 실제로 적용했는지 다시 확인해요
+      const fresh = await guild.members.fetch({ user: targetUser.id, force: true }).catch(() => null);
+      const until = fresh && fresh.communicationDisabledUntilTimestamp;
       const shown = applied >= 60000 ? `${Math.round(applied / 60000)}분` : `${Math.round(applied / 1000)}초`;
-      await reply(`⏱️ ${label} 님을 ${shown} 타임아웃했어요.`);
+      if (fresh && !(until && until > Date.now())) {
+        await reply(`⚠️ ${label} 님에게 타임아웃을 요청했지만 디스코드가 적용하지 않았어요. (대상: ${targetUser.tag}, ID ${targetUser.id}) 맞는 유저인지, 서버 주인/관리자가 아닌지 확인해주세요.`);
+      } else {
+        await reply(`⏱️ ${label} 님을 ${shown} 타임아웃했어요.${until ? ` (<t:${Math.floor(until / 1000)}:R> 풀려요)` : ''}`);
+      }
     } else if (kind === 'kick') {
       if (!targetMember) return (await reply('서버에 없는 유저는 추방할 수 없어요.'), true);
       await targetMember.kick(reason);
