@@ -1709,7 +1709,7 @@ async function handleSecurityCommand(interaction) {
   const persistNote = dbEnabled ? '' : '\n(DB가 없어서 봇이 재시작되면 설정이 사라져요)';
 
   if (sub === '보기') {
-    const lines = Object.entries(SEC_FEATURES).map(([k, v]) => `${c.on[k] ? '🟢' : '⚫'} ${v}`);
+    const lines = Object.entries(SEC_FEATURES).map(([k, v]) => `${c.on[k] ? '🟢 [켜짐]' : '⚫ [꺼짐]'} ${v}`);
     await reply(
       `🛡️ **보안 설정**\n${lines.join('\n')}\n처벌: ${c.punishMin}분 타임아웃 · 호출어: \`${c.call}\` (또는 봇 멘션)\n신뢰 유저 ${c.trusted.length}명 · 블랙리스트 ${Object.keys(c.black).length}명\n알림은 \`/알림채널\`로 정한 채널(없으면 서버 기본 채널)에 올라가요.`,
     );
