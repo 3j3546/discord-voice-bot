@@ -1595,6 +1595,7 @@ async function messageCommand(message) {
   else if (c.call && text.startsWith(c.call)) text = text.slice(c.call.length).replace(/^[\s,야아]+/, '');
   else return false;
   const action = (text.match(/(타임아웃|차단|밴|추방|킥|경고)/) || [])[1];
+  const release = /해제|풀어|풀기|취소/.test(text);
   if (!action) return false;
   const targetUser = message.mentions.users.find((u) => u.id !== client.user.id);
   if (!targetUser) return false;
@@ -1620,12 +1621,33 @@ async function messageCommand(message) {
   const label = `<@${targetUser.id}> (${targetUser.tag})`;
   const reply = (t) => message.reply({ content: t, allowedMentions: { parse: [], repliedUser: false } }).catch(() => {});
   try {
-    if (kind === 'timeout') {
-      const dm = text.replace(/<@!?\d+>/g, '').match(/(?:\d+\s*(?:일|시간|시|분)\s*)+/);
-      const ms = (dm && parseDuration(dm[0])) || c.punishMin * 60000;
+    if (kind === 'timeout' && release) {
+      if (!targetMember) return (await reply('서버에 없는 유저예요.'), true);
+      await targetMember.timeout(null, reason);
+      await reply(`✅ ${label} 님의 타임아웃을 풀었어요.`);
+    } else if (kind === 'ban' && release) {
+      await guild.bans.remove(targetUser.id, reason);
+      await reply(`✅ ${label} 님의 차단을 풀었어요.`);
+    } else if (kind === 'warn' && release) {
+      if (dbEnabled) await redis('HDEL', `warns:${guild.id}`, targetUser.id).catch(() => {});
+      memWarns.delete(`${guild.id}:${targetUser.id}`);
+      await reply(`✅ ${label} 님의 경고를 모두 지웠어요.`);
+    } else if (kind === 'kick' && release) {
+      await reply('추방은 되돌릴 수 없어요. 다시 초대해주세요.');
+    } else if (kind === 'timeout') {
+      const rest = text.replace(/<@!?\d+>/g, '');
+      const units = { 일: 86400000, 시간: 3600000, 시: 3600000, 분: 60000, 초: 1000 };
+      let ms = 0;
+      for (const m of rest.matchAll(/(\d+)\s*(일|시간|시|분|초)/g)) ms += Number(m[1]) * units[m[2]];
+      if (!ms) {
+        if (/\d/.test(rest)) return (await reply('시간을 못 읽었어요. `30초`, `3분`, `1시간 30분`, `2일`처럼 숫자와 단위를 붙여서 써주세요.'), true);
+        ms = c.punishMin * 60000; // 시간을 안 쓰면 /보안 처벌시간 값
+      }
       if (!targetMember) return (await reply('서버에 없는 유저는 타임아웃할 수 없어요.'), true);
-      await targetMember.timeout(Math.min(ms, MAX_TIMEOUT_MS), reason);
-      await reply(`⏱️ ${label} 님을 ${Math.round(Math.min(ms, MAX_TIMEOUT_MS) / 60000)}분 타임아웃했어요.`);
+      const applied = Math.min(ms, MAX_TIMEOUT_MS);
+      await targetMember.timeout(applied, reason);
+      const shown = applied >= 60000 ? `${Math.round(applied / 60000)}분` : `${Math.round(applied / 1000)}초`;
+      await reply(`⏱️ ${label} 님을 ${shown} 타임아웃했어요.`);
     } else if (kind === 'kick') {
       if (!targetMember) return (await reply('서버에 없는 유저는 추방할 수 없어요.'), true);
       await targetMember.kick(reason);
