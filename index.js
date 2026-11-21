@@ -53,6 +53,7 @@ const {
   SlashCommandBuilder,
   PermissionFlagsBits,
   ChannelType,
+  AuditLogEvent,
   EmbedBuilder,
   AttachmentBuilder,
   MessageFlags,
@@ -312,6 +313,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildModeration, // 서버테러 방어(감사 로그 감시)에 필요 (특권 인텐트 아님)
     GatewayIntentBits.MessageContent, // 끝말잇기 채팅 내용을 읽기 위해 필요
   ],
   // 디스코드 REST API(deferReply/reply 등)로 나가는 요청이 네트워크 문제로
@@ -1373,6 +1375,411 @@ async function handleRecommend(interaction) {
 }
 
 
+// ===== 보안 기능 (초대링크 검열 · 도배 검열 · 서버테러 방어 · 메시지 명령 · 블랙리스트) =====
+// 서버마다 /보안 으로 켜고 꺼요. 처음엔 전부 꺼져 있어요.
+// - 설정은 DB(`security:서버ID`)에 저장해요. 서버당 한 번 읽고, 설정을 바꿀 때만 써요. 메시지 검사는 전부 메모리에서 해요.
+// - "관리자 권한(Administrator)이 있는 사람"과 서버 주인, 신뢰 유저는 검열에서 빠져요.
+const SEC_FEATURES = {
+  invite: '타 서버 초대링크 검열',
+  spam: '도배·단타 검열',
+  nuke: '서버테러 방어',
+  cmd: '메시지 명령',
+};
+const MAX_TIMEOUT_MS = 28 * 24 * 60 * 60 * 1000; // 디스코드 타임아웃 최대 28일
+const secCfg = new Map(); // guildId -> 설정
+const memWarns = new Map(); // DB가 없을 때만 쓰는 경고 횟수 `guildId:userId` -> n
+
+function defaultSec() {
+  return { on: { invite: false, spam: false, nuke: false, cmd: false }, punishMin: 10, call: '입퇴장아', trusted: [], black: {} };
+}
+function getSec(guildId) {
+  let c = secCfg.get(guildId);
+  if (!c) {
+    c = defaultSec();
+    secCfg.set(guildId, c);
+  }
+  return c;
+}
+async function loadSec(guildId) {
+  if (!dbEnabled) return;
+  try {
+    const raw = await redis('GET', `security:${guildId}`);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    const c = defaultSec();
+    Object.assign(c.on, saved.on || {});
+    if (Number.isFinite(saved.punishMin)) c.punishMin = saved.punishMin;
+    if (typeof saved.call === 'string' && saved.call) c.call = saved.call;
+    if (Array.isArray(saved.trusted)) c.trusted = saved.trusted;
+    if (saved.black && typeof saved.black === 'object') c.black = saved.black;
+    secCfg.set(guildId, c);
+  } catch (e) {
+    console.error('보안 설정 불러오기 실패(기본값 사용):', e.message);
+  }
+}
+async function saveSec(guildId) {
+  if (!dbEnabled) return false;
+  try {
+    await redis('SET', `security:${guildId}`, JSON.stringify(getSec(guildId)));
+    return true;
+  } catch (e) {
+    console.error('보안 설정 저장 실패(메모리에는 반영됨):', e.message);
+    return false;
+  }
+}
+
+async function secLog(guild, text) {
+  try {
+    const ch = pickAnnounceChannel(guild);
+    if (ch && ch.send) await ch.send({ content: text.slice(0, 1900), allowedMentions: { parse: [] } });
+  } catch (e) {
+    console.error('보안 로그 전송 실패:', e.message);
+  }
+}
+
+function secExempt(guild, member, userId) {
+  if (!member) return false;
+  if (guild.ownerId === userId) return true;
+  if (member.permissions && member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+  return getSec(guild.id).trusted.includes(userId);
+}
+
+async function secTimeout(member, ms, reason) {
+  try {
+    await member.timeout(Math.min(ms, MAX_TIMEOUT_MS), reason);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// --- 초대링크 ---
+const INVITE_RE = /(?:discord(?:app)?\.com\/invite|discord\.gg|discord\.me|dsc\.gg)\/([A-Za-z0-9-]{2,32})/gi;
+const inviteCache = new Map(); // code -> { gid, at }
+async function inviteGuildId(code) {
+  const hit = inviteCache.get(code);
+  if (hit && Date.now() - hit.at < 6 * 3600 * 1000) return hit.gid;
+  try {
+    const inv = await client.fetchInvite(code);
+    const gid = (inv.guild && inv.guild.id) || (inv.channel && inv.channel.guildId) || null;
+    inviteCache.set(code, { gid, at: Date.now() });
+    if (inviteCache.size > 500) inviteCache.delete(inviteCache.keys().next().value);
+    return gid;
+  } catch (e) {
+    return undefined; // 확인 불가(만료된 초대 등)는 처벌하지 않아요
+  }
+}
+async function hasOtherServerInvite(message) {
+  const codes = [...message.content.matchAll(INVITE_RE)].map((m) => m[1]);
+  for (const code of new Set(codes)) {
+    const gid = await inviteGuildId(code);
+    if (gid && gid !== message.guildId) return true;
+  }
+  return false;
+}
+
+// --- 도배 ---
+const spamTrack = new Map(); // `guildId:userId` -> [{ t, n, id }]
+const normText = (s) => String(s).toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '');
+function detectSpam(message) {
+  const key = `${message.guildId}:${message.author.id}`;
+  const now = Date.now();
+  const arr = (spamTrack.get(key) || []).filter((x) => now - x.t < 20000);
+  const n = normText(message.content);
+  arr.push({ t: now, n, id: message.id });
+  spamTrack.set(key, arr);
+  if (spamTrack.size > 3000) {
+    for (const [k, v] of spamTrack) if (!v.length || now - v[v.length - 1].t > 20000) spamTrack.delete(k);
+  }
+  const text = message.content;
+  const junk = (text.length >= 800 && new Set(text).size / text.length < 0.05) || /(.)\1{59,}/su.test(text);
+  const same = n.length > 0 && arr.filter((x) => x.n === n).length >= 4;
+  const burst = arr.filter((x) => now - x.t < 7000).length >= 6;
+  if (!junk && !same && !burst) return null;
+  spamTrack.delete(key);
+  return { reason: junk ? '무의미한 긴 메시지' : same ? '같은 내용 반복' : '짧은 시간에 메시지 도배', ids: arr.map((x) => x.id) };
+}
+
+// --- 서버테러 방어 ---
+const nukeTrack = new Map(); // `guildId:executorId` -> [시각]
+const NUKE_WINDOW_MS = 10 * 1000;
+const NUKE_LIMIT = 3;
+const DANGEROUS = [
+  PermissionFlagsBits.Administrator,
+  PermissionFlagsBits.ManageGuild,
+  PermissionFlagsBits.ManageRoles,
+  PermissionFlagsBits.ManageChannels,
+  PermissionFlagsBits.KickMembers,
+  PermissionFlagsBits.BanMembers,
+  PermissionFlagsBits.ManageWebhooks,
+];
+async function defendNuke(guild, executorId, what) {
+  const me = guild.members.me;
+  const done = [];
+  const failed = [];
+  let member = null;
+  try {
+    member = await guild.members.fetch(executorId);
+  } catch (e) {
+    member = null;
+  }
+  if (member) {
+    const myTop = me ? me.roles.highest.position : 0;
+    const removable = member.roles.cache.filter((r) => r.id !== guild.id && !r.managed && r.position < myTop && DANGEROUS.some((p) => r.permissions.has(p)));
+    if (removable.size) {
+      try {
+        await member.roles.remove(removable, '서버테러 방어: 위험 권한 회수');
+        done.push(`위험 권한 역할 ${removable.size}개 회수 (${removable.map((r) => r.name).join(', ')})`);
+      } catch (e) {
+        failed.push('역할 회수 실패');
+      }
+    }
+    const stillDanger = member.roles.cache.some((r) => r.id !== guild.id && DANGEROUS.some((p) => r.permissions.has(p)) && (r.managed || r.position >= myTop));
+    if (member.user.bot && stillDanger) {
+      try {
+        await member.kick('서버테러 방어: 위험한 봇 추방');
+        done.push('봇 추방');
+      } catch (e) {
+        failed.push('봇 추방 실패');
+      }
+    } else if (!member.user.bot && (await secTimeout(member, 60 * 60 * 1000, '서버테러 방어'))) {
+      done.push('1시간 타임아웃');
+    }
+  } else failed.push('실행자를 찾지 못함');
+  await secLog(
+    guild,
+    `🚨 **서버테러 방어 작동** — <@${executorId}> 님이 짧은 시간에 ${what}을(를) 대량으로 했어요.\n${done.length ? `✅ ${done.join(' / ')}` : '⚠️ 할 수 있는 조치가 없었어요'}${failed.length ? `\n❌ ${failed.join(', ')} (봇 역할이 위쪽에 있어야 하고 필요한 권한이 있어야 해요)` : ''}\n서버 관리자는 바로 확인해주세요.`,
+  );
+}
+function onAuditEntry(entry, guild) {
+  const c = getSec(guild.id);
+  if (!c.on.nuke) return;
+  const types = {
+    [AuditLogEvent.ChannelDelete]: '채널 삭제',
+    [AuditLogEvent.RoleDelete]: '역할 삭제',
+    [AuditLogEvent.MemberKick]: '유저 추방',
+    [AuditLogEvent.MemberBanAdd]: '유저 차단',
+  };
+  const what = types[entry.action];
+  const exec = entry.executorId;
+  if (!what || !exec || exec === client.user.id || exec === guild.ownerId || c.trusted.includes(exec)) return;
+  const key = `${guild.id}:${exec}`;
+  const now = Date.now();
+  const arr = (nukeTrack.get(key) || []).filter((x) => now - x.t < NUKE_WINDOW_MS);
+  arr.push({ t: now, what });
+  nukeTrack.set(key, arr);
+  if (arr.length >= NUKE_LIMIT) {
+    nukeTrack.delete(key);
+    defendNuke(guild, exec, [...new Set(arr.map((x) => x.what))].join('·')).catch((e) => console.error('서버테러 방어 오류:', e.message));
+  }
+}
+
+// --- 메시지 명령 ("입퇴장아 @유저 1시간 타임아웃해줘") ---
+async function addWarn(guildId, userId) {
+  if (dbEnabled) {
+    try {
+      return Number(await redis('HINCRBY', `warns:${guildId}`, userId, 1));
+    } catch (e) {
+      console.error('경고 저장 실패:', e.message);
+    }
+  }
+  const k = `${guildId}:${userId}`;
+  memWarns.set(k, (memWarns.get(k) || 0) + 1);
+  return memWarns.get(k);
+}
+async function messageCommand(message) {
+  const c = getSec(message.guildId);
+  let text = message.content.trim();
+  const mention = new RegExp(`^<@!?${client.user.id}>\\s*`);
+  if (mention.test(text)) text = text.replace(mention, '');
+  else if (c.call && text.startsWith(c.call)) text = text.slice(c.call.length).replace(/^[\s,야아]+/, '');
+  else return false;
+  const action = (text.match(/(타임아웃|차단|밴|추방|킥|경고)/) || [])[1];
+  if (!action) return false;
+  const targetUser = message.mentions.users.find((u) => u.id !== client.user.id);
+  if (!targetUser) return false;
+
+  const guild = message.guild;
+  const author = message.member;
+  const kind = { 타임아웃: 'timeout', 경고: 'warn', 추방: 'kick', 킥: 'kick', 차단: 'ban', 밴: 'ban' }[action];
+  const needPerm = { timeout: PermissionFlagsBits.ModerateMembers, warn: PermissionFlagsBits.ModerateMembers, kick: PermissionFlagsBits.KickMembers, ban: PermissionFlagsBits.BanMembers }[kind];
+  if (!author || !author.permissions.has(needPerm)) {
+    await message.reply({ content: `이 명령을 쓰려면 ${action}할 수 있는 권한이 필요해요.`, allowedMentions: { repliedUser: false } }).catch(() => {});
+    return true;
+  }
+  const targetMember = await guild.members.fetch(targetUser.id).catch(() => null);
+  if (targetUser.id === message.author.id || targetUser.id === guild.ownerId) {
+    await message.reply({ content: '그 유저에게는 쓸 수 없어요.', allowedMentions: { repliedUser: false } }).catch(() => {});
+    return true;
+  }
+  if (targetMember && guild.ownerId !== message.author.id && targetMember.roles.highest.position >= author.roles.highest.position) {
+    await message.reply({ content: '나보다 같거나 높은 역할의 유저에게는 쓸 수 없어요.', allowedMentions: { repliedUser: false } }).catch(() => {});
+    return true;
+  }
+  const reason = `${message.author.tag}님이 메시지로 요청`;
+  const label = `<@${targetUser.id}> (${targetUser.tag})`;
+  const reply = (t) => message.reply({ content: t, allowedMentions: { parse: [], repliedUser: false } }).catch(() => {});
+  try {
+    if (kind === 'timeout') {
+      const dm = text.replace(/<@!?\d+>/g, '').match(/(?:\d+\s*(?:일|시간|시|분)\s*)+/);
+      const ms = (dm && parseDuration(dm[0])) || c.punishMin * 60000;
+      if (!targetMember) return (await reply('서버에 없는 유저는 타임아웃할 수 없어요.'), true);
+      await targetMember.timeout(Math.min(ms, MAX_TIMEOUT_MS), reason);
+      await reply(`⏱️ ${label} 님을 ${Math.round(Math.min(ms, MAX_TIMEOUT_MS) / 60000)}분 타임아웃했어요.`);
+    } else if (kind === 'kick') {
+      if (!targetMember) return (await reply('서버에 없는 유저는 추방할 수 없어요.'), true);
+      await targetMember.kick(reason);
+      await reply(`👢 ${label} 님을 추방했어요.`);
+    } else if (kind === 'ban') {
+      await guild.members.ban(targetUser.id, { reason });
+      await reply(`🔨 ${label} 님을 차단했어요.`);
+    } else {
+      const n = await addWarn(guild.id, targetUser.id);
+      await reply(`⚠️ ${label} 님에게 경고를 줬어요. (누적 ${n}회)`);
+      targetUser.send(`⚠️ **${guild.name}** 서버에서 경고를 받았어요. (누적 ${n}회)`).catch(() => {});
+    }
+    await secLog(guild, `🛡️ ${message.author.tag}님이 ${action} 명령 → ${label}`);
+  } catch (e) {
+    await reply(`실행하지 못했어요. 봇 권한과 역할 순서(봇 역할이 대상보다 위)를 확인해주세요. (${e.message})`);
+  }
+  return true;
+}
+
+// --- 메시지 한 건 검사. 처리했으면(삭제·명령 실행) true ---
+const blackAlerted = new Map();
+async function securityOnMessage(message) {
+  const guild = message.guild;
+  const c = getSec(guild.id);
+  const member = message.member;
+  if (c.black[message.author.id]) {
+    const last = blackAlerted.get(`${guild.id}:${message.author.id}`) || 0;
+    if (Date.now() - last > 6 * 3600 * 1000) {
+      blackAlerted.set(`${guild.id}:${message.author.id}`, Date.now());
+      secLog(guild, `🚫 **블랙리스트 유저 활동** — <@${message.author.id}> (${message.author.tag}) / 사유: ${c.black[message.author.id]}`);
+    }
+  }
+  if (!c.on.invite && !c.on.spam && !c.on.cmd) return false;
+  if (c.on.cmd && (await messageCommand(message))) return true;
+  if (!member || secExempt(guild, member, message.author.id)) return false;
+  const ms = c.punishMin * 60000;
+  if (c.on.invite && INVITE_RE.test(message.content)) {
+    INVITE_RE.lastIndex = 0;
+    if (await hasOtherServerInvite(message)) {
+      await message.delete().catch(() => {});
+      const ok = await secTimeout(member, ms, '타 서버 초대링크 전송');
+      secLog(guild, `🔗 **타 서버 초대링크** — <@${message.author.id}> 메시지 삭제${ok ? `, ${c.punishMin}분 타임아웃` : ' (타임아웃 실패: 봇 권한/역할 순서 확인)'}`);
+      return true;
+    }
+  }
+  INVITE_RE.lastIndex = 0;
+  if (c.on.spam) {
+    const hit = detectSpam(message);
+    if (hit) {
+      await message.channel.bulkDelete(hit.ids, true).catch(() => message.delete().catch(() => {}));
+      const ok = await secTimeout(member, ms, hit.reason);
+      secLog(guild, `💬 **${hit.reason}** — <@${message.author.id}> 메시지 삭제${ok ? `, ${c.punishMin}분 타임아웃` : ' (타임아웃 실패: 봇 권한/역할 순서 확인)'}`);
+      return true;
+    }
+  }
+  return false;
+}
+
+// --- /보안 명령어 ---
+function secMissingPerms(guild, feature) {
+  const me = guild.members.me;
+  if (!me) return [];
+  const need = {
+    invite: [['메시지 관리', PermissionFlagsBits.ManageMessages], ['멤버 타임아웃', PermissionFlagsBits.ModerateMembers]],
+    spam: [['메시지 관리', PermissionFlagsBits.ManageMessages], ['멤버 타임아웃', PermissionFlagsBits.ModerateMembers]],
+    nuke: [['감사 로그 보기', PermissionFlagsBits.ViewAuditLog], ['역할 관리', PermissionFlagsBits.ManageRoles], ['멤버 추방', PermissionFlagsBits.KickMembers], ['멤버 타임아웃', PermissionFlagsBits.ModerateMembers]],
+    cmd: [['멤버 타임아웃', PermissionFlagsBits.ModerateMembers], ['멤버 추방', PermissionFlagsBits.KickMembers], ['멤버 차단', PermissionFlagsBits.BanMembers]],
+  }[feature] || [];
+  return need.filter(([, p]) => !me.permissions.has(p)).map(([n]) => n);
+}
+
+async function handleSecurityCommand(interaction) {
+  const guild = interaction.guild;
+  if (!interaction.memberPermissions || !interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild)) {
+    await interaction.reply({ content: '이 명령어는 "서버 관리" 권한이 필요해요.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const sub = interaction.options.getSubcommand();
+  const c = getSec(guild.id);
+  const reply = (t) => interaction.reply({ content: t, flags: MessageFlags.Ephemeral });
+  const persistNote = dbEnabled ? '' : '\n(DB가 없어서 봇이 재시작되면 설정이 사라져요)';
+
+  if (sub === '보기') {
+    const lines = Object.entries(SEC_FEATURES).map(([k, v]) => `${c.on[k] ? '🟢' : '⚫'} ${v}`);
+    await reply(
+      `🛡️ **보안 설정**\n${lines.join('\n')}\n처벌: ${c.punishMin}분 타임아웃 · 호출어: \`${c.call}\` (또는 봇 멘션)\n신뢰 유저 ${c.trusted.length}명 · 블랙리스트 ${Object.keys(c.black).length}명\n알림은 \`/알림채널\`로 정한 채널(없으면 서버 기본 채널)에 올라가요.`,
+    );
+    return;
+  }
+  if (sub === '켜기끄기') {
+    const feature = interaction.options.getString('기능');
+    const on = interaction.options.getBoolean('켜기');
+    c.on[feature] = on;
+    await saveSec(guild.id);
+    const missing = on ? secMissingPerms(guild, feature) : [];
+    await reply(`${on ? '🟢 켰어요' : '⚫ 껐어요'}: ${SEC_FEATURES[feature]}${missing.length ? `\n⚠️ 봇에게 아래 권한이 없어서 일부 동작이 안 될 수 있어요: ${missing.join(', ')}` : ''}${persistNote}`);
+    return;
+  }
+  if (sub === '처벌시간') {
+    c.punishMin = interaction.options.getInteger('분');
+    await saveSec(guild.id);
+    await reply(`✅ 자동 처벌(타임아웃) 시간을 ${c.punishMin}분으로 바꿨어요.${persistNote}`);
+    return;
+  }
+  if (sub === '호출어') {
+    c.call = interaction.options.getString('단어').trim();
+    await saveSec(guild.id);
+    await reply(`✅ 메시지 명령 호출어: \`${c.call}\`\n예: \`${c.call} @유저 1시간 타임아웃해줘\` (봇을 멘션해서 불러도 돼요)${persistNote}`);
+    return;
+  }
+  if (sub === '신뢰추가' || sub === '신뢰삭제') {
+    const user = interaction.options.getUser('유저');
+    if (sub === '신뢰추가') {
+      if (!c.trusted.includes(user.id)) c.trusted.push(user.id);
+    } else c.trusted = c.trusted.filter((x) => x !== user.id);
+    await saveSec(guild.id);
+    await reply(`✅ <@${user.id}> 님을 신뢰 유저에서 ${sub === '신뢰추가' ? '추가' : '삭제'}했어요. (신뢰 유저는 검열·서버테러 방어에서 빠져요)${persistNote}`);
+    return;
+  }
+  if (sub === '블랙리스트추가') {
+    const user = interaction.options.getUser('유저');
+    const why = (interaction.options.getString('사유') || '사유 없음').slice(0, 100);
+    if (Object.keys(c.black).length >= 200 && !c.black[user.id]) {
+      await reply('블랙리스트는 서버당 200명까지예요.');
+      return;
+    }
+    c.black[user.id] = why;
+    await saveSec(guild.id);
+    await reply(`🚫 <@${user.id}> 님을 이 서버 블랙리스트에 올렸어요. 이 유저가 말을 하면 알림 채널에 알려드려요.${persistNote}`);
+    return;
+  }
+  if (sub === '블랙리스트삭제') {
+    const user = interaction.options.getUser('유저');
+    delete c.black[user.id];
+    await saveSec(guild.id);
+    await reply(`✅ <@${user.id}> 님을 블랙리스트에서 뺐어요.${persistNote}`);
+    return;
+  }
+  if (sub === '블랙리스트목록') {
+    const rows = Object.entries(c.black).map(([id, why]) => `<@${id}> — ${why}`);
+    await reply(rows.length ? `🚫 **블랙리스트**\n${rows.join('\n').slice(0, 1800)}` : '블랙리스트가 비어 있어요.');
+    return;
+  }
+  if (sub === '스캔') {
+    const found = guild.members.cache.filter((m) => c.black[m.id]);
+    await reply(
+      found.size
+        ? `🚫 이 서버에서 블랙리스트 유저를 ${found.size}명 찾았어요:\n${found.map((m) => `<@${m.id}> — ${c.black[m.id]}`).join('\n').slice(0, 1800)}`
+        : '블랙리스트 유저가 지금 확인된 멤버 중에는 없어요.\n(봇이 본 적 있는 멤버만 확인할 수 있어요. 말을 하면 그때 알림이 가요.)',
+    );
+  }
+}
+
+
 // DeepL 번역 API를 이용한 번역.
 // DEEPL_API_KEY 환경변수가 필요합니다 (deepl.com에서 무료 가입, 신용카드 불필요,
 // 한 달에 500,000자까지 무료). source를 안 주면 한국어 포함 여부로 자동 추정합니다.
@@ -1687,6 +2094,53 @@ const commands = [
         .addChoices({ name: '유튜브', value: 'youtube' }, { name: 'SOOP(숲)', value: 'soop' }),
     )
     .addStringOption((option) => option.setName('검색어').setDescription('원하는 주제가 있으면 입력 (예: 로블록스, 게임)').setMaxLength(30)),
+  new SlashCommandBuilder()
+    .setName('보안')
+    .setDescription('보안 기능 설정 (서버 관리 권한 필요)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addSubcommand((s) => s.setName('보기').setDescription('현재 보안 설정 보기'))
+    .addSubcommand((s) =>
+      s
+        .setName('켜기끄기')
+        .setDescription('보안 기능을 켜거나 꺼요')
+        .addStringOption((o) =>
+          o
+            .setName('기능')
+            .setDescription('기능')
+            .setRequired(true)
+            .addChoices(
+              { name: '타 서버 초대링크 검열', value: 'invite' },
+              { name: '도배·단타 검열', value: 'spam' },
+              { name: '서버테러 방어', value: 'nuke' },
+              { name: '메시지 명령 (호출어로 타임아웃/차단 등)', value: 'cmd' },
+            ),
+        )
+        .addBooleanOption((o) => o.setName('켜기').setDescription('켜기/끄기').setRequired(true)),
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('처벌시간')
+        .setDescription('자동 타임아웃 시간(분)')
+        .addIntegerOption((o) => o.setName('분').setDescription('1 ~ 40320 (최대 28일)').setRequired(true).setMinValue(1).setMaxValue(40320)),
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('호출어')
+        .setDescription('메시지 명령을 부를 때 쓰는 말')
+        .addStringOption((o) => o.setName('단어').setDescription('예: 입퇴장아').setRequired(true).setMaxLength(10)),
+    )
+    .addSubcommand((s) => s.setName('신뢰추가').setDescription('검열·테러 방어에서 빼줄 유저').addUserOption((o) => o.setName('유저').setDescription('유저').setRequired(true)))
+    .addSubcommand((s) => s.setName('신뢰삭제').setDescription('신뢰 유저에서 빼기').addUserOption((o) => o.setName('유저').setDescription('유저').setRequired(true)))
+    .addSubcommand((s) =>
+      s
+        .setName('블랙리스트추가')
+        .setDescription('이 서버 블랙리스트에 유저 추가')
+        .addUserOption((o) => o.setName('유저').setDescription('유저').setRequired(true))
+        .addStringOption((o) => o.setName('사유').setDescription('사유').setMaxLength(100)),
+    )
+    .addSubcommand((s) => s.setName('블랙리스트삭제').setDescription('블랙리스트에서 빼기').addUserOption((o) => o.setName('유저').setDescription('유저').setRequired(true)))
+    .addSubcommand((s) => s.setName('블랙리스트목록').setDescription('블랙리스트 보기'))
+    .addSubcommand((s) => s.setName('스캔').setDescription('이 서버에서 블랙리스트 유저 찾기')),
 ].map((command) => command.toJSON());
 
 async function registerCommandsForGuild(guildId) {
@@ -1712,6 +2166,7 @@ client.once(Events.ClientReady, async (c) => {
   if (dbEnabled) {
     for (const guild of c.guilds.cache.values()) {
       await loadSettings(guild.id);
+      await loadSec(guild.id);
     }
     console.log('🗄️ DB(Upstash Redis) 연결됨: 저장된 서버 설정을 불러왔어요.');
     setInterval(() => checkReminders().catch((e) => console.error(e.message)), 60 * 1000);
@@ -1732,7 +2187,16 @@ client.once(Events.ClientReady, async (c) => {
   }
 });
 
+client.on(Events.GuildAuditLogEntryCreate, (entry, guild) => {
+  try {
+    onAuditEntry(entry, guild);
+  } catch (error) {
+    console.error('감사 로그 처리 오류:', error.message);
+  }
+});
+
 client.on(Events.GuildCreate, (guild) => {
+  loadSec(guild.id);
   registerCommandsForGuild(guild.id);
   loadSettings(guild.id);
 });
@@ -2426,6 +2890,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.error('DB 기능 처리 오류:', error.stack || error);
       await interaction.editReply('처리 중 오류가 발생했어요. DB 연결 상태를 확인하거나 잠시 후 다시 시도해주세요.');
     }
+    return;
+  }
+
+  if (interaction.commandName === '보안') {
+    await handleSecurityCommand(interaction);
     return;
   }
 
@@ -3157,6 +3626,15 @@ async function aiWordChainTurn(game) {
 // 끝말잇기 진행 중인 채널의 일반 채팅 메시지를 감시합니다.
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
+
+  // 보안: 초대링크/도배 검열, 메시지 명령 (켜져 있을 때만 동작). 처리했으면 여기서 끝냅니다.
+  if (message.guild) {
+    try {
+      if (await securityOnMessage(message)) return;
+    } catch (error) {
+      console.error('보안 검사 오류:', error.message);
+    }
+  }
 
 
   // 챗봇: 지정된 채팅 채널의 모든 글, 또는 어느 채널이든 봇을 @멘션한 글에 AI가 대답합니다.
