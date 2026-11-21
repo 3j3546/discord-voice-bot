@@ -1256,6 +1256,123 @@ async function handleStreamCommand(interaction) {
 }
 
 
+// ===== 채널 추천 (지금 방송 중인 인기 채널, 유튜브 · SOOP) =====
+// 플랫폼에서 지금 방송 중인 채널을 가져와 보여줘요. DB는 쓰지 않고, 5분 동안 결과를 기억해서 요청이 많아도 사이트를 자주 두드리지 않아요.
+// 성인(19세) 방송, 비밀번호 방송, 구독자 전용 방송은 빼요.
+const RECOMMEND_CACHE_MS = 5 * 60 * 1000;
+const RECOMMEND_COUNT = 8;
+const recommendCache = new Map(); // "platform:검색어" -> { at, items }
+
+function findAll(node, key, out = []) {
+  if (!node || typeof node !== 'object') return out;
+  if (Array.isArray(node)) {
+    for (const x of node) findAll(x, key, out);
+    return out;
+  }
+  for (const [k, v] of Object.entries(node)) {
+    if (k === key) out.push(v);
+    else findAll(v, key, out);
+  }
+  return out;
+}
+
+async function recommendYoutube(query) {
+  const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&sp=${encodeURIComponent('EgJAAQ==')}`;
+  const res = await fetchWithTimeout(url, { headers: { 'User-Agent': BROWSER_UA, 'Accept-Language': 'ko-KR,ko;q=0.9', Cookie: 'CONSENT=YES+1; SOCS=CAI' } }, 15000);
+  if (!res.ok) throw new Error(`유튜브 서버가 접속을 거절했어요 (HTTP ${res.status})`);
+  const html = await res.text();
+  const m = html.match(/var ytInitialData = (\{.*?\});<\/script>/s);
+  if (!m) throw new Error('유튜브가 검색 결과 대신 다른 화면(동의/차단)을 보여줬어요');
+  const data = JSON.parse(m[1]);
+  const items = [];
+  const seen = new Set();
+  for (const vr of findAll(data, 'videoRenderer')) {
+    if (!vr || !vr.videoId || seen.has(vr.videoId)) continue;
+    const badges = JSON.stringify(vr.badges || []);
+    if (!badges.includes('LIVE_NOW') || badges.includes('AGE_RESTRICTED')) continue; // 지금 방송 중인 것만
+    const runs = (vr.ownerText && vr.ownerText.runs) || [];
+    const viewers = vr.viewCountText ? (vr.viewCountText.simpleText || (vr.viewCountText.runs || []).map((r) => r.text).join('')) : '';
+    seen.add(vr.videoId);
+    items.push({
+      name: ((runs[0] && runs[0].text) || '알 수 없음').trim(),
+      title: ((vr.title && vr.title.runs && vr.title.runs[0] && vr.title.runs[0].text) || '').replace(/\s+/g, ' ').trim(),
+      viewers: viewers.replace(/\s+/g, ' ').trim(),
+      url: `https://www.youtube.com/watch?v=${vr.videoId}`,
+    });
+    if (items.length >= RECOMMEND_COUNT) break;
+  }
+  return items;
+}
+
+async function recommendSoop(query) {
+  const res = await fetchWithTimeout(
+    'https://live.sooplive.co.kr/api/main_broad_list_api.php?selectType=action&selectValue=all&orderType=view_cnt&pageNo=1&lang=ko',
+    { headers: { 'User-Agent': BROWSER_UA, Accept: 'application/json', Referer: 'https://www.sooplive.co.kr/' } },
+    10000,
+  );
+  if (!res.ok) throw new Error(`SOOP 서버가 접속을 거절했어요 (HTTP ${res.status})`);
+  const text = await res.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch (e) {
+    throw new Error('SOOP 응답을 읽지 못했어요');
+  }
+  const q = query ? query.toLowerCase() : '';
+  const items = [];
+  for (const b of json.broad || []) {
+    if (String(b.broad_grade) === '19' || b.is_password === 'Y' || String(b.subscription_only) === '1') continue;
+    const title = String(b.broad_title || '').replace(/\s+/g, ' ').trim();
+    if (q && !(title.toLowerCase().includes(q) || String(b.user_nick || '').toLowerCase().includes(q) || String(b.category_name || '').toLowerCase().includes(q))) continue;
+    items.push({
+      name: b.user_nick || b.user_id,
+      title,
+      viewers: `${Number(b.current_view_cnt || b.total_view_cnt || 0).toLocaleString('ko-KR')}명`,
+      url: `https://play.sooplive.co.kr/${b.user_id}/${b.broad_no}`,
+      category: b.category_name || '',
+    });
+    if (items.length >= RECOMMEND_COUNT) break;
+  }
+  return items;
+}
+
+async function handleRecommend(interaction) {
+  const platform = interaction.options.getString('플랫폼');
+  const query = (interaction.options.getString('검색어') || '').trim().slice(0, 30);
+  await interaction.deferReply();
+  try {
+    const cacheKey = `${platform}:${platform === 'youtube' ? query || '라이브' : query}`;
+    let hit = recommendCache.get(cacheKey);
+    if (!hit || Date.now() - hit.at > RECOMMEND_CACHE_MS) {
+      const items = platform === 'youtube' ? await recommendYoutube(query || '라이브') : await recommendSoop(query);
+      hit = { at: Date.now(), items };
+      recommendCache.set(cacheKey, hit);
+      if (recommendCache.size > 50) recommendCache.delete(recommendCache.keys().next().value);
+    }
+    const meta = STREAM_PLATFORMS[platform];
+    if (!hit.items.length) {
+      await interaction.editReply(`지금 ${meta.label}에서 ${query ? `"${query}" 조건에 맞는 ` : ''}방송 중인 채널을 찾지 못했어요.`);
+      return;
+    }
+    const lines = hit.items.map((it, n) => {
+      const title = it.title.length > 60 ? `${it.title.slice(0, 59)}…` : it.title;
+      const viewers = it.viewers ? ` · 👀 ${it.viewers}` : '';
+      const cat = it.category ? ` · ${it.category}` : '';
+      return `**${n + 1}. [${it.name.replace(/[\[\]]/g, '')}](${it.url})**${viewers}${cat}\n${title}`;
+    });
+    const embed = new EmbedBuilder()
+      .setColor(meta.color)
+      .setTitle(`📺 지금 방송 중인 ${meta.label} 추천${query ? ` · ${query}` : ''}`)
+      .setDescription(lines.join('\n\n').slice(0, 4000))
+      .setFooter({ text: '5분마다 갱신돼요 · 성인·비밀번호·구독자 전용 방송은 제외' });
+    await interaction.editReply({ embeds: [embed] });
+  } catch (error) {
+    console.error(`채널 추천 오류(${platform}):`, error.message);
+    await interaction.editReply(`추천 채널을 가져오지 못했어요. (${error.message})`).catch(() => {});
+  }
+}
+
+
 // DeepL 번역 API를 이용한 번역.
 // DEEPL_API_KEY 환경변수가 필요합니다 (deepl.com에서 무료 가입, 신용카드 불필요,
 // 한 달에 500,000자까지 무료). source를 안 주면 한국어 포함 여부로 자동 추정합니다.
@@ -1559,6 +1676,17 @@ const commands = [
     .setName('방송알림삭제')
     .setDescription('방송 알림을 삭제합니다')
     .addStringOption((option) => option.setName('번호').setDescription('/방송알림목록에 나온 번호').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('채널추천')
+    .setDescription('지금 방송 중인 인기 채널을 추천해드려요')
+    .addStringOption((option) =>
+      option
+        .setName('플랫폼')
+        .setDescription('추천받을 플랫폼')
+        .setRequired(true)
+        .addChoices({ name: '유튜브', value: 'youtube' }, { name: 'SOOP(숲)', value: 'soop' }),
+    )
+    .addStringOption((option) => option.setName('검색어').setDescription('원하는 주제가 있으면 입력 (예: 로블록스, 게임)').setMaxLength(30)),
 ].map((command) => command.toJSON());
 
 async function registerCommandsForGuild(guildId) {
@@ -2298,6 +2426,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.error('DB 기능 처리 오류:', error.stack || error);
       await interaction.editReply('처리 중 오류가 발생했어요. DB 연결 상태를 확인하거나 잠시 후 다시 시도해주세요.');
     }
+    return;
+  }
+
+  if (interaction.commandName === '채널추천') {
+    await handleRecommend(interaction);
     return;
   }
 
