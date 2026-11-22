@@ -483,6 +483,159 @@ function buildRpsRow() {
   );
 }
 
+// ===== 베라31 (베스킨라빈스31, 2명) =====
+// /베라31 → 시작한 사람 + 참가 버튼을 누른 1명 → 순서를 무작위로 정함 → 번갈아 1~3개씩 숫자를 말해서 31을 말하는 사람이 져요.
+// 채널별 상태: { phase: 'recruit' | 'play', host, players: [{id,name}], turn, count, log, timer }
+const br31Games = new Map();
+const BR31_RECRUIT_MS = 2 * 60 * 1000;
+const BR31_IDLE_MS = 3 * 60 * 1000;
+
+function br31Timer(channelId, message, ms, text) {
+  const g = br31Games.get(channelId);
+  if (!g) return;
+  clearTimeout(g.timer);
+  g.timer = setTimeout(async () => {
+    if (br31Games.get(channelId) !== g) return;
+    br31Games.delete(channelId);
+    try {
+      await message.edit({ content: text, components: [], allowedMentions: { parse: [] } });
+    } catch (e) {
+      // 메시지가 지워졌으면 무시
+    }
+  }, ms);
+}
+
+function br31RecruitRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('br31_join').setLabel('참가').setEmoji('🍦').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId('br31_cancel').setLabel('취소').setStyle(ButtonStyle.Secondary),
+  );
+}
+
+// 지금 숫자(count) 다음부터 말할 수 있는 선택지 버튼: 1개 → "4", 2개 → "4~5", 3개 → "4~6" (31을 넘는 선택지는 없어요)
+function br31PlayRow(count) {
+  const row = new ActionRowBuilder();
+  for (let k = 1; k <= 3; k++) {
+    if (count + k > 31) break;
+    const label = k === 1 ? `${count + 1}` : `${count + 1}~${count + k}`;
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`br31_n${k}`)
+        .setLabel(label)
+        .setStyle(count + k === 31 ? ButtonStyle.Danger : ButtonStyle.Primary),
+    );
+  }
+  return row;
+}
+
+function br31Text(g, note) {
+  const cur = g.players[g.turn];
+  const order = g.players.map((p, i) => `${i + 1}번 ${p.name}`).join(' → ');
+  return [
+    '🍦 **베라31** — 31을 말하는 사람이 져요!',
+    `순서: ${order}`,
+    `현재 숫자: **${g.count}**`,
+    g.log.length ? `기록: ${g.log.slice(-4).join(' / ')}` : '',
+    note || '',
+    `👉 **${g.turn + 1}번 ${cur.name}** 님 차례예요. 말할 숫자를 골라주세요.`,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+async function handleBr31Button(interaction) {
+  const game = br31Games.get(interaction.channelId);
+  const id = interaction.customId;
+  const name = interaction.user.displayName ?? interaction.user.username;
+  if (!game) {
+    await interaction.reply({ content: '진행 중인 베라31이 없어요. `/베라31`로 새로 시작해주세요.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (id === 'br31_cancel') {
+    if (game.phase !== 'recruit' || interaction.user.id !== game.host.id) {
+      await interaction.reply({ content: '시작한 사람만, 모집 중일 때 취소할 수 있어요.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    clearTimeout(game.timer);
+    br31Games.delete(interaction.channelId);
+    await interaction.update({ content: '🍦 베라31 모집이 취소됐어요.', components: [], allowedMentions: { parse: [] } });
+    return;
+  }
+  if (id === 'br31_join') {
+    if (game.phase !== 'recruit') {
+      await interaction.reply({ content: '이미 시작된 게임이에요.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (interaction.user.id === game.host.id) {
+      await interaction.reply({ content: '시작한 사람은 이미 참가 중이에요. 같이 할 사람이 눌러야 해요.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const players = [game.host, { id: interaction.user.id, name }];
+    if (Math.random() < 0.5) players.reverse(); // 순서 무작위
+    Object.assign(game, { phase: 'play', players, turn: 0, count: 0, log: [] });
+    const note = `🎲 순서를 정했어요! 1번은 **${players[0].name}** 님이에요.`;
+    await interaction.update({ content: br31Text(game, note), components: [br31PlayRow(0)], allowedMentions: { parse: [] } });
+    br31Timer(interaction.channelId, interaction.message, BR31_IDLE_MS, '🍦 오랫동안 아무도 누르지 않아 베라31이 끝났어요.');
+    return;
+  }
+
+  // 숫자 선택 (br31_n1 ~ br31_n3)
+  if (game.phase !== 'play') {
+    await interaction.reply({ content: '아직 참가자를 모으는 중이에요.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const cur = game.players[game.turn];
+  if (interaction.user.id !== cur.id) {
+    const isPlayer = game.players.some((p) => p.id === interaction.user.id);
+    await interaction.reply({ content: isPlayer ? '지금은 상대방 차례예요!' : '이 게임의 참가자가 아니에요.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const k = Number(id.replace('br31_n', ''));
+  if (![1, 2, 3].includes(k) || game.count + k > 31) {
+    await interaction.reply({ content: '그 선택은 할 수 없어요.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const from = game.count + 1;
+  game.count += k;
+  game.log.push(`${cur.name}: ${k === 1 ? from : `${from}~${game.count}`}`);
+  if (game.count === 31) {
+    clearTimeout(game.timer);
+    br31Games.delete(interaction.channelId);
+    const winner = game.players[1 - game.turn];
+    await interaction.update({
+      content: [
+        '🍦 **베라31 끝!**',
+        `기록: ${game.log.slice(-4).join(' / ')}`,
+        `💥 **${cur.name}** 님이 31을 말해버렸어요!`,
+        `🏆 **${winner.name}** 님이 이겼어요!`,
+      ].join('\n'),
+      components: [],
+      allowedMentions: { parse: [] },
+    });
+    return;
+  }
+  game.turn = 1 - game.turn;
+  await interaction.update({ content: br31Text(game), components: [br31PlayRow(game.count)], allowedMentions: { parse: [] } });
+  br31Timer(interaction.channelId, interaction.message, BR31_IDLE_MS, '🍦 오랫동안 아무도 누르지 않아 베라31이 끝났어요.');
+}
+
+async function startBr31(interaction) {
+  if (br31Games.get(interaction.channelId)) {
+    await interaction.reply({ content: '이미 이 채널에서 베라31이 진행 중이에요.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const name = interaction.user.displayName ?? interaction.user.username;
+  br31Games.set(interaction.channelId, { phase: 'recruit', host: { id: interaction.user.id, name }, players: [], turn: 0, count: 0, log: [], timer: null });
+  const msg = await interaction.reply({
+    content: `🍦 **베라31** 같이 할 사람을 찾아요! (2명)\n시작한 사람: **${name}** · 아래 **참가** 버튼을 눌러주세요. (2분 안에)`,
+    components: [br31RecruitRow()],
+    allowedMentions: { parse: [] },
+    withResponse: true,
+  });
+  const message = (msg && msg.resource && msg.resource.message) || (await interaction.fetchReply());
+  br31Timer(interaction.channelId, message, BR31_RECRUIT_MS, '🍦 아무도 참가하지 않아 베라31 모집이 끝났어요.');
+}
+
 // 한글 한 글자를 초성/중성/종성으로 분해합니다 (두음법칙 처리에 사용).
 const HANGUL_START = 0xac00;
 const HANGUL_END = 0xd7a3;
@@ -1031,7 +1184,7 @@ async function notifyStream(key, status) {
     .setColor(meta.color)
     .setTitle(`🔴 ${entry.n} 방송 시작!`)
     .setURL(streamUrl(platform, id, status.vid))
-    .setDescription(status.title ? `**${status.title}**\n지금 바로 보러 가기 👉 ${streamUrl(platform, id, status.vid)}` : `지금 바로 보러 가기 👉 ${streamUrl(platform, id, status.vid)}`)
+    .setDescription(status.title ? `**${status.title}**\n[지금 바로 보러 가기 👉](${streamUrl(platform, id, status.vid)})` : `[지금 바로 보러 가기 👉](${streamUrl(platform, id, status.vid)})`)
     .setFooter({ text: meta.label })
     .setTimestamp();
   let removedAny = false;
@@ -1039,10 +1192,11 @@ async function notifyStream(key, status) {
     try {
       if (sub.k === 'c') {
         const channel = await client.channels.fetch(sub.c);
+        const isEveryone = Boolean(sub.r) && sub.r === sub.g; // @everyone 역할의 ID는 서버 ID와 같아요
         await channel.send({
-          content: sub.r ? `<@&${sub.r}>` : undefined,
+          content: sub.r ? (isEveryone ? '@everyone' : `<@&${sub.r}>`) : undefined,
           embeds: [embed],
-          allowedMentions: { roles: sub.r ? [sub.r] : [] },
+          allowedMentions: isEveryone ? { parse: ['everyone'] } : { roles: sub.r ? [sub.r] : [] },
         });
       } else {
         const user = await client.users.fetch(sub.u);
@@ -1947,6 +2101,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName('가위바위보')
     .setDescription('버튼으로 진행하는 가위바위보 (최대 2명)'),
+  new SlashCommandBuilder().setName('베라31').setDescription('둘이서 하는 베스킨라빈스31 (31을 말하면 져요)'),
   new SlashCommandBuilder()
     .setName('날씨')
     .setDescription('특정 지역의 현재 날씨를 알려줍니다 (기상청)')
@@ -2280,6 +2435,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   }
 
+
+  if (interaction.isButton() && interaction.customId.startsWith('br31_')) {
+    if (!interaction.inGuild()) return;
+    await handleBr31Button(interaction);
+    return;
+  }
 
   if (interaction.isButton() && interaction.customId.startsWith('rps_')) {
     if (!interaction.inGuild()) return;
@@ -2621,6 +2782,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         `🔤 끝말잇기를 종료합니다. 총 ${game.usedWords.size}개의 단어가 나왔어요!`,
       );
     }
+    return;
+  }
+
+  if (interaction.commandName === '베라31') {
+    await startBr31(interaction);
     return;
   }
 
