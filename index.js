@@ -909,7 +909,7 @@ async function checkBirthdays() {
 
       const channel = pickAnnounceChannel(guild);
       if (!channel) {
-        console.error(`생일 알림을 보낼 채널이 없어요 (서버: ${guild.name}). /알림채널로 지정해주세요.`);
+        console.error(`생일 알림을 보낼 채널이 없어요 (서버: ${guild.name}). /설정 → 1번(알림 채널)으로 지정해주세요.`);
         continue;
       }
       await channel.send({
@@ -1530,7 +1530,7 @@ async function handleRecommend(interaction) {
 
 
 // ===== 보안 기능 (초대링크 검열 · 도배 검열 · 서버테러 방어 · 메시지 명령 · 블랙리스트) =====
-// 서버마다 /보안 으로 켜고 꺼요. 처음엔 전부 꺼져 있어요.
+// 서버마다 /설정 → 3번에서 켜고 꺼요. 처음엔 전부 꺼져 있어요.
 // - 설정은 DB(`security:서버ID`)에 저장해요. 서버당 한 번 읽고, 설정을 바꿀 때만 써요. 메시지 검사는 전부 메모리에서 해요.
 // - "관리자 권한(Administrator)이 있는 사람"과 서버 주인, 신뢰 유저는 검열에서 빠져요.
 const SEC_FEATURES = {
@@ -1797,7 +1797,7 @@ async function messageCommand(message) {
       for (const m of rest.matchAll(/(\d+)\s*(일|시간|시|분|초)/g)) ms += Number(m[1]) * units[m[2]];
       if (!ms) {
         if (/\d/.test(rest)) return (await reply('시간을 못 읽었어요. `30초`, `3분`, `1시간 30분`, `2일`처럼 숫자와 단위를 붙여서 써주세요.'), true);
-        ms = c.punishMin * 60000; // 시간을 안 쓰면 /보안 처벌시간 값
+        ms = c.punishMin * 60000; // 시간을 안 쓰면 /설정 → 4번(자동 처벌 시간) 값
       }
       if (!targetMember) return (await reply('서버에 없는 유저는 타임아웃할 수 없어요.'), true);
       const applied = Math.min(ms, MAX_TIMEOUT_MS);
@@ -1869,7 +1869,7 @@ async function securityOnMessage(message) {
   return false;
 }
 
-// --- /보안 명령어 ---
+// --- 보안 기능 도우미 ---
 function secMissingPerms(guild, feature) {
   const me = guild.members.me;
   if (!me) return [];
@@ -1882,85 +1882,267 @@ function secMissingPerms(guild, feature) {
   return need.filter(([, p]) => !me.permissions.has(p)).map(([n]) => n);
 }
 
-async function handleSecurityCommand(interaction) {
-  const guild = interaction.guild;
-  if (!interaction.memberPermissions || !interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild)) {
-    await interaction.reply({ content: '이 명령어는 "서버 관리" 권한이 필요해요.', flags: MessageFlags.Ephemeral });
-    return;
-  }
-  const sub = interaction.options.getSubcommand();
-  const c = getSec(guild.id);
-  const reply = (t) => interaction.reply({ content: t, flags: MessageFlags.Ephemeral });
-  const persistNote = dbEnabled ? '' : '\n(DB가 없어서 봇이 재시작되면 설정이 사라져요)';
+// ===== /설정 — 관리자용 설정 도우미 =====
+// /설정 을 치면 번호 목록이 나오고, 채팅창에 번호(예: 3)를 보내서 고르면 돼요. 알림 채널, 챗봇 채널, 보안 기능, 방송 알림 관리를 여기서 해요.
+// "서버 관리" 권한이 있는 사람만 쓸 수 있어요. 설정하는 동안 그 사람의 메시지는 다른 기능(챗봇·보안 검사)이 건드리지 않아요.
+const settingsActive = new Set(); // `${channelId}:${userId}`
+const SET_WAIT_MS = 90 * 1000;
+const SET_MENU = [
+  '🛠️ **서버 설정** — 채팅창에 **번호**를 보내주세요.',
+  '`1` 알림 채널 (입퇴장·생일·보안 알림이 올라갈 곳)',
+  '`2` 챗봇 채널 (AI가 대답할 곳)',
+  '`3` 보안 기능 켜기/끄기',
+  '`4` 보안 자동 처벌 시간',
+  '`5` 메시지 명령 호출어',
+  '`6` 신뢰 유저 (검열에서 빼줄 사람)',
+  '`7` 블랙리스트',
+  '`8` 방송 알림 보기/삭제 (서버 채널)',
+  '`9` 현재 설정 보기',
+  '`0` 종료',
+].join('\n');
 
-  if (sub === '보기') {
-    const lines = Object.entries(SEC_FEATURES).map(([k, v]) => `${c.on[k] ? '🟢 [켜짐]' : '⚫ [꺼짐]'} ${v}`);
-    await reply(
-      `🛡️ **보안 설정**\n${lines.join('\n')}\n처벌: ${c.punishMin}분 타임아웃 · 호출어: \`${c.call}\` (또는 봇 멘션)\n신뢰 유저 ${c.trusted.length}명 · 블랙리스트 ${Object.keys(c.black).length}명\n알림은 \`/알림채널\`로 정한 채널(없으면 서버 기본 채널)에 올라가요.`,
-    );
+function firstMentionedUser(m) {
+  const id = ([...m.content.matchAll(/<@!?(\d+)>/g)][0] || [])[1];
+  return id ? m.mentions.users.get(id) || null : null;
+}
+function firstMentionedChannel(m) {
+  const id = ([...m.content.matchAll(/<#(\d+)>/g)][0] || [])[1];
+  const ch = id ? m.guild.channels.cache.get(id) : null;
+  return ch && (ch.type === ChannelType.GuildText || ch.type === ChannelType.GuildAnnouncement) ? ch : null;
+}
+
+async function handleSettingsWizard(interaction) {
+  if (!interaction.memberPermissions || !interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild)) {
+    await interaction.reply({ content: '이 명령어는 "서버 관리" 권한이 있는 사람만 쓸 수 있어요.', flags: MessageFlags.Ephemeral });
     return;
   }
-  if (sub === '켜기끄기') {
-    const feature = interaction.options.getString('기능');
-    const on = interaction.options.getBoolean('켜기');
-    c.on[feature] = on;
-    await saveSec(guild.id);
-    const missing = on ? secMissingPerms(guild, feature) : [];
-    await reply(`${on ? '🟢 켰어요' : '⚫ 껐어요'}: ${SEC_FEATURES[feature]}${missing.length ? `\n⚠️ 봇에게 아래 권한이 없어서 일부 동작이 안 될 수 있어요: ${missing.join(', ')}` : ''}${persistNote}`);
+  const guild = interaction.guild;
+  const channel = interaction.channel;
+  const userId = interaction.user.id;
+  const key = `${channel.id}:${userId}`;
+  if (settingsActive.has(key)) {
+    await interaction.reply({ content: '이미 설정 중이에요. 번호를 보내거나 `0`으로 종료해주세요.', flags: MessageFlags.Ephemeral });
     return;
   }
-  if (sub === '처벌시간') {
-    c.punishMin = interaction.options.getInteger('분');
-    await saveSec(guild.id);
-    await reply(`✅ 자동 처벌(타임아웃) 시간을 ${c.punishMin}분으로 바꿨어요.${persistNote}`);
-    return;
-  }
-  if (sub === '호출어') {
-    c.call = interaction.options.getString('단어').trim();
-    await saveSec(guild.id);
-    await reply(`✅ 메시지 명령 호출어: \`${c.call}\`\n예: \`${c.call} @유저 1시간 타임아웃해줘\` (봇을 멘션해서 불러도 돼요)${persistNote}`);
-    return;
-  }
-  if (sub === '신뢰추가' || sub === '신뢰삭제') {
-    const user = interaction.options.getUser('유저');
-    if (sub === '신뢰추가') {
-      if (!c.trusted.includes(user.id)) c.trusted.push(user.id);
-    } else c.trusted = c.trusted.filter((x) => x !== user.id);
-    await saveSec(guild.id);
-    await reply(`✅ <@${user.id}> 님을 신뢰 유저에서 ${sub === '신뢰추가' ? '추가' : '삭제'}했어요. (신뢰 유저는 검열·서버테러 방어에서 빠져요)${persistNote}`);
-    return;
-  }
-  if (sub === '블랙리스트추가') {
-    const user = interaction.options.getUser('유저');
-    const why = (interaction.options.getString('사유') || '사유 없음').slice(0, 100);
-    if (Object.keys(c.black).length >= 200 && !c.black[user.id]) {
-      await reply('블랙리스트는 서버당 200명까지예요.');
-      return;
+  settingsActive.add(key);
+  const say = (text) => channel.send({ content: text.slice(0, 1990), allowedMentions: { parse: [] } });
+  // 질문을 보내고 내 답장 한 개를 기다려요. 시간이 지나면 null
+  const ask = async (text) => {
+    if (text) await say(text);
+    const got = await channel.awaitMessages({ filter: (m) => m.author.id === userId, max: 1, time: SET_WAIT_MS });
+    return got.first() || null;
+  };
+  const botCanSend = (ch) => {
+    const me = guild.members.me;
+    const p = me && ch.permissionsFor(me);
+    return Boolean(p && p.has(PermissionFlagsBits.ViewChannel) && p.has(PermissionFlagsBits.SendMessages));
+  };
+
+  // 채널 하나를 고르는 공통 흐름 (알림 채널, 챗봇 채널)
+  const channelFlow = async (title, settingKey, extraNote) => {
+    const settings = getSettings(guild.id);
+    const cur = settings[settingKey];
+    const m = await ask(`${title} — 지금: ${cur ? `<#${cur}>` : extraNote}\n새 채널을 #멘션으로 보내주세요. 지정을 풀려면 \`해제\`, 돌아가려면 \`취소\`.`);
+    if (!m) return 'timeout';
+    const t = m.content.trim();
+    if (t === '취소') return null;
+    if (t === '해제') {
+      settings[settingKey] = null;
+      await saveSettings(guild.id);
+      await say('✅ 지정을 풀었어요.');
+      return null;
     }
-    c.black[user.id] = why;
-    await saveSec(guild.id);
-    await reply(`🚫 <@${user.id}> 님을 이 서버 블랙리스트에 올렸어요. 이 유저가 말을 하면 알림 채널에 알려드려요.${persistNote}`);
-    return;
-  }
-  if (sub === '블랙리스트삭제') {
-    const user = interaction.options.getUser('유저');
-    delete c.black[user.id];
-    await saveSec(guild.id);
-    await reply(`✅ <@${user.id}> 님을 블랙리스트에서 뺐어요.${persistNote}`);
-    return;
-  }
-  if (sub === '블랙리스트목록') {
-    const rows = Object.entries(c.black).map(([id, why]) => `<@${id}> — ${why}`);
-    await reply(rows.length ? `🚫 **블랙리스트**\n${rows.join('\n').slice(0, 1800)}` : '블랙리스트가 비어 있어요.');
-    return;
-  }
-  if (sub === '스캔') {
-    const found = guild.members.cache.filter((m) => c.black[m.id]);
-    await reply(
-      found.size
-        ? `🚫 이 서버에서 블랙리스트 유저를 ${found.size}명 찾았어요:\n${found.map((m) => `<@${m.id}> — ${c.black[m.id]}`).join('\n').slice(0, 1800)}`
-        : '블랙리스트 유저가 지금 확인된 멤버 중에는 없어요.\n(봇이 본 적 있는 멤버만 확인할 수 있어요. 말을 하면 그때 알림이 가요.)',
-    );
+    const ch = firstMentionedChannel(m);
+    if (!ch) {
+      await say('채널을 못 찾았어요. `#채널이름` 모양으로 멘션해주세요.');
+      return null;
+    }
+    if (!botCanSend(ch)) {
+      await say(`봇이 <#${ch.id}> 채널에서 글을 쓸 수 없어요. 봇 역할에 "채널 보기"와 "메시지 보내기" 권한을 준 뒤 다시 해주세요.`);
+      return null;
+    }
+    settings[settingKey] = ch.id;
+    await saveSettings(guild.id);
+    await say(`✅ <#${ch.id}> 채널로 정했어요.${settingKey === 'chatChannelId' && !GEMINI_API_KEY ? '\n⚠️ GEMINI_API_KEY가 없어서 대답은 못 해요.' : ''}`);
+    return null;
+  };
+
+  const flows = {
+    1: () => channelFlow('📢 **알림 채널**', 'logChannelId', '각 음성채널 채팅'),
+    2: () => channelFlow('🤖 **챗봇 채널**', 'chatChannelId', '지정 안 됨'),
+    3: async () => {
+      const keys = Object.keys(SEC_FEATURES);
+      for (;;) {
+        const c = getSec(guild.id);
+        const list = keys.map((k, i) => `\`${i + 1}\` ${c.on[k] ? '🟢 [켜짐]' : '⚫ [꺼짐]'} ${SEC_FEATURES[k]}`).join('\n');
+        const m = await ask(`🛡️ **보안 기능**\n${list}\n바꿀 번호를 보내주세요 (여러 개는 \`1 3\`처럼). 돌아가려면 \`0\`.`);
+        if (!m) return 'timeout';
+        const t = m.content.trim();
+        if (t === '0' || t === '취소') return null;
+        const nums = [...new Set(t.split(/[\s,]+/).map(Number).filter((n) => n >= 1 && n <= keys.length))];
+        if (!nums.length) {
+          await say('번호를 확인해주세요.');
+          continue;
+        }
+        const notes = [];
+        for (const n of nums) {
+          const k = keys[n - 1];
+          c.on[k] = !c.on[k];
+          if (c.on[k]) {
+            const missing = secMissingPerms(guild, k);
+            if (missing.length) notes.push(`⚠️ ${SEC_FEATURES[k]}: 봇에 권한이 없어요 → ${missing.join(', ')}`);
+          }
+        }
+        await saveSec(guild.id);
+        if (notes.length) await say(notes.join('\n'));
+      }
+    },
+    4: async () => {
+      const c = getSec(guild.id);
+      const m = await ask(`⏱️ **자동 처벌 시간** — 지금 ${c.punishMin}분\n몇 분으로 할까요? (1 ~ 40320, 돌아가려면 \`취소\`)`);
+      if (!m) return 'timeout';
+      const n = parseInt(m.content, 10);
+      if (!(n >= 1 && n <= 40320)) {
+        await say(m.content.trim() === '취소' ? '취소했어요.' : '1 ~ 40320 사이 숫자로 보내주세요.');
+        return null;
+      }
+      c.punishMin = n;
+      await saveSec(guild.id);
+      await say(`✅ 자동 처벌은 ${n}분 타임아웃이에요.`);
+      return null;
+    },
+    5: async () => {
+      const c = getSec(guild.id);
+      const m = await ask(`📣 **호출어** — 지금 \`${c.call}\` (봇 멘션으로도 불러요)\n새 호출어를 보내주세요. (최대 10글자, 돌아가려면 \`취소\`)\n예: \`${c.call} @유저 1시간 타임아웃해줘\``);
+      if (!m) return 'timeout';
+      const w = m.content.trim();
+      if (w === '취소') return null;
+      if (!w || w.length > 10) {
+        await say('1~10글자로 보내주세요.');
+        return null;
+      }
+      c.call = w;
+      await saveSec(guild.id);
+      await say(`✅ 호출어는 \`${w}\` 예요.`);
+      return null;
+    },
+    6: async () => {
+      const c = getSec(guild.id);
+      const now = c.trusted.length ? c.trusted.map((id) => `<@${id}>`).join(' ') : '없음';
+      const m = await ask(`🤝 **신뢰 유저** (검열·서버테러 방어에서 빠져요) — 지금: ${now}\n\`추가 @유저\` / \`삭제 @유저\` 로 보내주세요. (돌아가려면 \`취소\`)`);
+      if (!m) return 'timeout';
+      const t = m.content.trim();
+      const u = firstMentionedUser(m);
+      if (/^추가/.test(t) && u) {
+        if (!c.trusted.includes(u.id)) c.trusted.push(u.id);
+        await saveSec(guild.id);
+        await say(`✅ <@${u.id}> 님을 신뢰 유저로 추가했어요.`);
+      } else if (/^삭제/.test(t) && u) {
+        c.trusted = c.trusted.filter((x) => x !== u.id);
+        await saveSec(guild.id);
+        await say(`✅ <@${u.id}> 님을 뺐어요.`);
+      } else if (t !== '취소') await say('`추가 @유저` 또는 `삭제 @유저` 모양으로 보내주세요.');
+      return null;
+    },
+    7: async () => {
+      const c = getSec(guild.id);
+      const ids = Object.keys(c.black);
+      const list = ids.length ? ids.map((id) => `<@${id}> — ${c.black[id]}`).join('\n') : '비어 있음';
+      const m = await ask(`🚫 **블랙리스트** (이 서버 전용)\n${list}\n\`추가 @유저 사유\` / \`삭제 @유저\` / \`스캔\` (지금 서버에서 찾기) 중에서 보내주세요. (돌아가려면 \`취소\`)`);
+      if (!m) return 'timeout';
+      const t = m.content.trim();
+      const u = firstMentionedUser(m);
+      if (/^추가/.test(t) && u) {
+        if (ids.length >= 200 && !c.black[u.id]) {
+          await say('블랙리스트는 200명까지예요.');
+          return null;
+        }
+        c.black[u.id] = (t.replace(/^추가/, '').replace(/<@!?\d+>/g, '').trim() || '사유 없음').slice(0, 100);
+        await saveSec(guild.id);
+        await say(`🚫 <@${u.id}> 님을 올렸어요. 이 유저가 말하면 알림 채널에 알려드려요.`);
+      } else if (/^삭제/.test(t) && u) {
+        delete c.black[u.id];
+        await saveSec(guild.id);
+        await say(`✅ <@${u.id}> 님을 뺐어요.`);
+      } else if (t === '스캔') {
+        const found = guild.members.cache.filter((mm) => c.black[mm.id]);
+        await say(found.size ? `🚫 블랙리스트 유저 ${found.size}명 발견:\n${found.map((mm) => `<@${mm.id}> — ${c.black[mm.id]}`).join('\n')}` : '지금 확인된 멤버 중에는 없어요. (봇이 본 적 있는 멤버만 확인할 수 있어요)');
+      } else if (t !== '취소') await say('`추가 @유저 사유`, `삭제 @유저`, `스캔` 중에서 보내주세요.');
+      return null;
+    },
+    8: async () => {
+      const rows = [];
+      for (const [k, entry] of streamSubs) for (const sub of entry.s) if (sub.k === 'c' && sub.g === guild.id) rows.push({ key: k, sub, name: entry.n });
+      if (!rows.length) {
+        await say('📺 이 서버에 등록된 방송 알림이 없어요. 새로 등록은 `/방송알림추가`로 해주세요.');
+        return null;
+      }
+      const m = await ask(`📺 **방송 알림 (서버 채널)**\n${streamSubLines(rows).join('\n')}\n지우려면 \`삭제 번호\`(맨 앞 코드)를 보내주세요. (돌아가려면 \`취소\`. 새로 등록은 \`/방송알림추가\`)`);
+      if (!m) return 'timeout';
+      const mm = m.content.trim().match(/^삭제\s+(\S+)/);
+      if (!mm) {
+        if (m.content.trim() !== '취소') await say('`삭제 번호` 모양으로 보내주세요. 예: `삭제 ab12c`');
+        return null;
+      }
+      const target = rows.find((r) => r.sub.i === mm[1]);
+      if (!target) {
+        await say('그 번호를 못 찾았어요.');
+        return null;
+      }
+      const entry = streamSubs.get(target.key);
+      entry.s = entry.s.filter((s) => s.i !== mm[1]);
+      await saveStream(target.key);
+      await say(`🗑️ **${target.name}** 방송 알림을 지웠어요.`);
+      return null;
+    },
+    9: async () => {
+      const s = getSettings(guild.id);
+      const c = getSec(guild.id);
+      const nSubs = [...streamSubs.values()].reduce((a, e) => a + e.s.filter((x) => x.k === 'c' && x.g === guild.id).length, 0);
+      await say(
+        [
+          '📋 **현재 설정**',
+          `알림 채널: ${s.logChannelId ? `<#${s.logChannelId}>` : '각 음성채널 채팅'}`,
+          `챗봇 채널: ${s.chatChannelId ? `<#${s.chatChannelId}>` : '지정 안 됨'}`,
+          ...Object.entries(SEC_FEATURES).map(([k, v]) => `${c.on[k] ? '🟢 [켜짐]' : '⚫ [꺼짐]'} ${v}`),
+          `자동 처벌 ${c.punishMin}분 · 호출어 \`${c.call}\` · 신뢰 ${c.trusted.length}명 · 블랙리스트 ${Object.keys(c.black).length}명`,
+          `방송 알림(서버 채널) ${nSubs}개`,
+        ].join('\n'),
+      );
+      return null;
+    },
+  };
+
+  try {
+    await interaction.reply({ content: SET_MENU, allowedMentions: { parse: [] } });
+    for (;;) {
+      const m = await ask();
+      if (!m) {
+        await say('⏱️ 시간이 지나 설정을 닫았어요. 다시 하려면 `/설정`을 쳐주세요.');
+        break;
+      }
+      const t = m.content.trim();
+      if (t === '0' || /^(종료|취소|끝)$/.test(t)) {
+        await say('✅ 설정을 닫았어요.');
+        break;
+      }
+      const flow = flows[parseInt(t, 10)];
+      if (!flow) {
+        await say('메뉴에 있는 번호를 보내주세요. (종료는 `0`)');
+        continue;
+      }
+      const result = await flow();
+      if (result === 'timeout') {
+        await say('⏱️ 시간이 지나 설정을 닫았어요. 다시 하려면 `/설정`을 쳐주세요.');
+        break;
+      }
+      await say(SET_MENU);
+    }
+  } catch (error) {
+    console.error('설정 도우미 오류:', error.stack || error);
+    await say('설정 중 오류가 났어요. 다시 `/설정`을 쳐주세요.').catch(() => {});
+  } finally {
+    settingsActive.delete(key);
   }
 }
 
@@ -2025,18 +2207,9 @@ async function translateToEnglishIfKorean(text) {
 // ===== 슬래시 명령어 정의 =====
 const commands = [
   new SlashCommandBuilder()
-    .setName('알림채널')
-    .setDescription('입퇴장 글자 알림을 올릴 텍스트 채널을 지정합니다 (서버 관리 권한 필요)')
-    .addChannelOption((option) =>
-      option
-        .setName('채널')
-        .setDescription('알림을 올릴 텍스트 채널')
-        .setRequired(true)
-        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
-    ),
-  new SlashCommandBuilder()
-    .setName('알림채널해제')
-    .setDescription('지정한 알림 채널을 해제합니다 (다시 각 음성채널 채팅에 올라갑니다)'),
+    .setName('설정')
+    .setDescription('서버 설정 도우미 — 번호를 채팅으로 보내서 고르기 (서버 관리 권한 필요)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder()
     .setName('설정확인')
     .setDescription('현재 알림 채널 설정을 확인합니다'),
@@ -2209,17 +2382,6 @@ const commands = [
     .setDescription('AI(Gemini)에게 무엇이든 물어봅니다')
     .addStringOption((option) => option.setName('내용').setDescription('질문 내용').setRequired(true).setMaxLength(1000)),
   new SlashCommandBuilder()
-    .setName('챗봇채널')
-    .setDescription('이 채널에서 아무 말이나 하면 AI가 대답하도록 지정합니다 (서버 관리 권한 필요)')
-    .addChannelOption((option) =>
-      option
-        .setName('채널')
-        .setDescription('AI와 대화할 텍스트 채널')
-        .setRequired(true)
-        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement),
-    ),
-  new SlashCommandBuilder().setName('챗봇채널해제').setDescription('챗봇 채널 지정을 해제합니다 (서버 관리 권한 필요)'),
-  new SlashCommandBuilder()
     .setName('생일등록')
     .setDescription('내 생일을 등록하면 그날 알림 채널에서 축하해줘요')
     .addIntegerOption((option) => option.setName('월').setDescription('태어난 달 (1~12)').setRequired(true).setMinValue(1).setMaxValue(12))
@@ -2280,53 +2442,6 @@ const commands = [
         .addChoices({ name: '유튜브', value: 'youtube' }, { name: 'SOOP(숲)', value: 'soop' }),
     )
     .addStringOption((option) => option.setName('검색어').setDescription('원하는 주제가 있으면 입력 (예: 로블록스, 게임)').setMaxLength(30)),
-  new SlashCommandBuilder()
-    .setName('보안')
-    .setDescription('보안 기능 설정 (서버 관리 권한 필요)')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addSubcommand((s) => s.setName('보기').setDescription('현재 보안 설정 보기'))
-    .addSubcommand((s) =>
-      s
-        .setName('켜기끄기')
-        .setDescription('보안 기능을 켜거나 꺼요')
-        .addStringOption((o) =>
-          o
-            .setName('기능')
-            .setDescription('기능')
-            .setRequired(true)
-            .addChoices(
-              { name: '타 서버 초대링크 검열', value: 'invite' },
-              { name: '도배·단타 검열', value: 'spam' },
-              { name: '서버테러 방어', value: 'nuke' },
-              { name: '메시지 명령 (호출어로 타임아웃/차단 등)', value: 'cmd' },
-            ),
-        )
-        .addBooleanOption((o) => o.setName('켜기').setDescription('켜기/끄기').setRequired(true)),
-    )
-    .addSubcommand((s) =>
-      s
-        .setName('처벌시간')
-        .setDescription('자동 타임아웃 시간(분)')
-        .addIntegerOption((o) => o.setName('분').setDescription('1 ~ 40320 (최대 28일)').setRequired(true).setMinValue(1).setMaxValue(40320)),
-    )
-    .addSubcommand((s) =>
-      s
-        .setName('호출어')
-        .setDescription('메시지 명령을 부를 때 쓰는 말')
-        .addStringOption((o) => o.setName('단어').setDescription('예: 입퇴장아').setRequired(true).setMaxLength(10)),
-    )
-    .addSubcommand((s) => s.setName('신뢰추가').setDescription('검열·테러 방어에서 빼줄 유저').addUserOption((o) => o.setName('유저').setDescription('유저').setRequired(true)))
-    .addSubcommand((s) => s.setName('신뢰삭제').setDescription('신뢰 유저에서 빼기').addUserOption((o) => o.setName('유저').setDescription('유저').setRequired(true)))
-    .addSubcommand((s) =>
-      s
-        .setName('블랙리스트추가')
-        .setDescription('이 서버 블랙리스트에 유저 추가')
-        .addUserOption((o) => o.setName('유저').setDescription('유저').setRequired(true))
-        .addStringOption((o) => o.setName('사유').setDescription('사유').setMaxLength(100)),
-    )
-    .addSubcommand((s) => s.setName('블랙리스트삭제').setDescription('블랙리스트에서 빼기').addUserOption((o) => o.setName('유저').setDescription('유저').setRequired(true)))
-    .addSubcommand((s) => s.setName('블랙리스트목록').setDescription('블랙리스트 보기'))
-    .addSubcommand((s) => s.setName('스캔').setDescription('이 서버에서 블랙리스트 유저 찾기')),
 ].map((command) => command.toJSON());
 
 async function registerCommandsForGuild(guildId) {
@@ -2491,64 +2606,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
   const member = interaction.member;
   const guildId = interaction.guildId;
 
-  // ===== 설정 명령어 (서버 관리 권한 필요) =====
-  if (['알림채널', '알림채널해제', '챗봇채널', '챗봇채널해제'].includes(interaction.commandName)) {
-    if (!member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-      await interaction.reply({
-        content: '이 명령어는 "서버 관리" 권한이 있는 사람만 사용할 수 있어요.',
-        flags: MessageFlags.Ephemeral,
-      });
-      return;
-    }
-
-    const settings = getSettings(guildId);
-
-    if (interaction.commandName === '알림채널') {
-      const channel = interaction.options.getChannel('채널');
-      const me = interaction.guild.members.me;
-      const perms = me && channel.permissionsFor(me);
-      if (!perms || !perms.has(PermissionFlagsBits.ViewChannel) || !perms.has(PermissionFlagsBits.SendMessages)) {
-        await interaction.reply({
-          content: `봇이 <#${channel.id}> 채널에서 글을 쓸 수 없어요. 그 채널에서 봇 역할에 "채널 보기"와 "메시지 보내기" 권한을 준 뒤 다시 시도해주세요.`,
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
-      settings.logChannelId = channel.id;
-      saveSettings(guildId);
-      await interaction.reply({
-        content: `입퇴장 글자 알림을 <#${channel.id}> 채널에 올리도록 설정했어요.\n(DB에 저장돼서 봇이 재시작돼도 유지돼요.)`,
-        flags: MessageFlags.Ephemeral,
-      });
-    } else if (interaction.commandName === '알림채널해제') {
-      settings.logChannelId = null;
-      saveSettings(guildId);
-      await interaction.reply({
-        content: '알림 채널 지정을 해제했어요. 이제 각 음성채널의 채팅에 글자 알림이 올라가요.',
-        flags: MessageFlags.Ephemeral,
-      });
-    } else if (interaction.commandName === '챗봇채널') {
-      const channel = interaction.options.getChannel('채널');
-      const me = interaction.guild.members.me;
-      const perms = me && channel.permissionsFor(me);
-      if (!perms || !perms.has(PermissionFlagsBits.ViewChannel) || !perms.has(PermissionFlagsBits.SendMessages)) {
-        await interaction.reply({
-          content: `봇이 <#${channel.id}> 채널에서 글을 쓸 수 없어요. 봇 역할에 "채널 보기"와 "메시지 보내기" 권한을 준 뒤 다시 시도해주세요.`,
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
-      settings.chatChannelId = channel.id;
-      saveSettings(guildId);
-      await interaction.reply({
-        content: `<#${channel.id}> 채널에서 말을 걸면 AI가 대답하도록 설정했어요.${GEMINI_API_KEY ? '' : '\n⚠️ 아직 GEMINI_API_KEY가 없어서 대답은 못 해요. Render 환경변수에 넣어주세요.'}`,
-        flags: MessageFlags.Ephemeral,
-      });
-    } else if (interaction.commandName === '챗봇채널해제') {
-      settings.chatChannelId = null;
-      saveSettings(guildId);
-      await interaction.reply({ content: '챗봇 채널 지정을 해제했어요. (/질문 과 @멘션은 계속 쓸 수 있어요)', flags: MessageFlags.Ephemeral });
-    }
+  if (interaction.commandName === '설정') {
+    await handleSettingsWizard(interaction);
     return;
   }
 
@@ -3087,11 +3146,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       console.error('DB 기능 처리 오류:', error.stack || error);
       await interaction.editReply('처리 중 오류가 발생했어요. DB 연결 상태를 확인하거나 잠시 후 다시 시도해주세요.');
     }
-    return;
-  }
-
-  if (interaction.commandName === '보안') {
-    await handleSecurityCommand(interaction);
     return;
   }
 
@@ -3933,6 +3987,9 @@ async function aiWordChainTurn(game) {
 // 끝말잇기 진행 중인 채널의 일반 채팅 메시지를 감시합니다.
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
+
+  // /설정 도우미가 이 사람의 답장을 기다리는 중이면 다른 기능은 건드리지 않아요.
+  if (settingsActive.has(`${message.channelId}:${message.author.id}`)) return;
 
   // 보안: 초대링크/도배 검열, 메시지 명령 (켜져 있을 때만 동작). 처리했으면 여기서 끝냅니다.
   if (message.guild) {
