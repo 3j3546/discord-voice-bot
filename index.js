@@ -2819,7 +2819,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       ];
       if (w.rain && w.rain !== '강수없음' && Number(w.rain) > 0) lines.push(`🌧️ 최근 1시간 강수량 ${w.rain}mm`);
       lines.push('', '출처: 기상청');
-      await interaction.editReply(lines.join('\n'));
+      await sendWeather(interaction, w.description, lines.join('\n'));
     } catch (error) {
       console.error('기상청 날씨 조회 오류:', error.message);
       await interaction.editReply('날씨 정보를 가져오는 중 오류가 발생했어요. 잠시 후 다시 시도해주세요.');
@@ -2858,7 +2858,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         `💧 습도 ${current.humidity}%\n\n` +
         closing;
 
-      await interaction.editReply(reply);
+      await sendWeather(interaction, description, reply);
     } catch (error) {
       console.error('날씨 조회 오류:', error.stack || error);
       await interaction.editReply('날씨 정보를 가져오는 중 오류가 발생했어요. 지역 이름을 다시 확인해보세요.');
@@ -3640,6 +3640,116 @@ async function kmaGet(operation, params) {
   if (header && header.resultCode !== '00') throw new Error(`기상청 오류 ${header.resultCode}: ${header.resultMsg}`);
   const item = data.response && data.response.body && data.response.body.items && data.response.body.items.item;
   return !item ? [] : Array.isArray(item) ? item : [item];
+}
+
+// ===== 날씨 그림 (맑음·구름·흐림·비·눈·눈비·소나기·천둥·안개) =====
+// 인터넷에서 사진을 가져오지 않고, 코드로 그린 그림(SVG)을 sharp로 PNG로 바꿔서 날씨 결과에 붙여요.
+// (외부 사진은 주소가 바뀌거나 저작권 문제가 있을 수 있어서 직접 그려요.) 한 번 만든 그림은 기억해 둬요.
+const weatherImageCache = new Map();
+
+function weatherKind(description) {
+  const d = String(description || '');
+  if (/천둥|번개|뇌우|thunder/i.test(d)) return 'thunder';
+  if (/눈/.test(d) && /비|빗/.test(d)) return 'sleet';
+  if (/진눈깨비|sleet/i.test(d)) return 'sleet';
+  if (/눈|snow|blizzard/i.test(d)) return 'snow';
+  if (/소나기|shower/i.test(d)) return 'shower';
+  if (/비|빗|rain|drizzle/i.test(d)) return 'rain';
+  if (/안개|연무|박무|mist|fog/i.test(d)) return 'fog';
+  if (/흐림|흐린|overcast/i.test(d)) return 'overcast';
+  if (/구름|cloud/i.test(d)) return 'partly';
+  if (/맑|clear|sunny/i.test(d)) return 'clear';
+  return 'partly';
+}
+
+function weatherSvg(kind, night) {
+  const W = 800;
+  const H = 360;
+  const skies = {
+    clear: night ? ['#0b1a3a', '#223a73'] : ['#4aa8ff', '#bfe3ff'],
+    partly: night ? ['#0f1f40', '#33477d'] : ['#5aa9ee', '#cfe6fb'],
+    overcast: night ? ['#1f2433', '#3a4152'] : ['#7d8896', '#b9c1cb'],
+    rain: night ? ['#151b2b', '#2c3548'] : ['#5b6879', '#97a3b3'],
+    shower: night ? ['#151b2b', '#2c3548'] : ['#5f7087', '#9fb0c4'],
+    thunder: night ? ['#0f1220', '#2a2f48'] : ['#3f4659', '#7b8399'],
+    snow: night ? ['#1a2540', '#3d507a'] : ['#8fb4de', '#e8f1fb'],
+    sleet: night ? ['#1a2236', '#3a4864'] : ['#7f98b5', '#c5d3e2'],
+    fog: night ? ['#262b36', '#4a505e'] : ['#9aa5b1', '#d3d9df'],
+  };
+  const [c1, c2] = skies[kind] || skies.partly;
+  const grayCloud = kind === 'overcast' || kind === 'rain' || kind === 'thunder' || kind === 'shower' || kind === 'sleet';
+  const cloudFill = grayCloud ? (night ? '#8a93a8' : kind === 'overcast' ? '#e4e8ed' : '#cfd6df') : night ? '#a9b4c9' : '#ffffff';
+  const cloud = (x, y, s, fill = cloudFill, op = 1) =>
+    `<g transform="translate(${x} ${y}) scale(${s})" fill="${fill}" opacity="${op}"><circle cx="0" cy="0" r="42"/><circle cx="52" cy="-22" r="56"/><circle cx="108" cy="2" r="42"/><rect x="-42" y="0" width="192" height="44" rx="22"/></g>`;
+  const sun = (x, y, r) => {
+    const rays = Array.from({ length: 12 }, (_, i) => {
+      const a = (i * Math.PI) / 6;
+      return `<line x1="${x + Math.cos(a) * (r + 14)}" y1="${y + Math.sin(a) * (r + 14)}" x2="${x + Math.cos(a) * (r + 40)}" y2="${y + Math.sin(a) * (r + 40)}" stroke="#ffd34d" stroke-width="9" stroke-linecap="round"/>`;
+    }).join('');
+    return `${rays}<circle cx="${x}" cy="${y}" r="${r}" fill="#ffd34d"/><circle cx="${x}" cy="${y}" r="${r - 12}" fill="#ffe382"/>`;
+  };
+  const moon = (x, y, r) =>
+    `<mask id="m"><rect width="${W}" height="${H}" fill="#fff"/><circle cx="${x + r * 0.55}" cy="${y - r * 0.2}" r="${r * 0.9}" fill="#000"/></mask><circle cx="${x}" cy="${y}" r="${r}" fill="#fff3b0" mask="url(#m)"/>`;
+  const stars = () =>
+    [[90, 60], [200, 120], [330, 50], [470, 90], [610, 40], [720, 110], [150, 200], [560, 190], [690, 230], [60, 130]]
+      .map(([x, y], i) => `<circle cx="${x}" cy="${y}" r="${1.5 + (i % 3)}" fill="#fff" opacity="0.8"/>`)
+      .join('');
+  const drops = (n, color, len, seed) => {
+    let out = '';
+    for (let i = 0; i < n; i++) {
+      const x = 160 + ((i * 53 + seed * 17) % 480);
+      const y = 215 + ((i * 37 + seed * 11) % 120);
+      out += `<line x1="${x}" y1="${y}" x2="${x - 12}" y2="${y + len}" stroke="${color}" stroke-width="6" stroke-linecap="round" opacity="0.9"/>`;
+    }
+    return out;
+  };
+  const flake = (x, y, r) =>
+    [0, 60, 120].map((a) => `<line x1="${x - r}" y1="${y}" x2="${x + r}" y2="${y}" stroke="#fff" stroke-width="4" stroke-linecap="round" transform="rotate(${a} ${x} ${y})"/>`).join('');
+  const flakes = (n, seed) => {
+    let out = '';
+    for (let i = 0; i < n; i++) out += flake(150 + ((i * 61 + seed * 19) % 500), 225 + ((i * 43 + seed * 13) % 115), 9 + (i % 3) * 3);
+    return out;
+  };
+
+  let body = '';
+  if (kind === 'clear') body = night ? `${stars()}${moon(400, 175, 85)}` : sun(400, 180, 78);
+  else if (kind === 'partly') body = `${night ? stars() + moon(330, 150, 70) : sun(340, 150, 70)}${cloud(380, 215, 1.25)}`;
+  else if (kind === 'overcast') body = `${cloud(250, 170, 1.15, cloudFill, 0.8)}${cloud(400, 205, 1.35)}`;
+  else if (kind === 'rain') body = `${cloud(300, 150, 1.45)}${drops(14, '#7cc0ff', 40, 1)}`;
+  else if (kind === 'shower') body = `${night ? stars() : sun(560, 85, 38)}${cloud(300, 150, 1.45)}${drops(9, '#7cc0ff', 48, 3)}`;
+  else if (kind === 'thunder') body = `${cloud(300, 140, 1.5)}<polygon points="410,185 360,265 400,265 372,335 460,235 418,235 445,185" fill="#ffd34d" stroke="#fff3b0" stroke-width="3"/>${drops(6, '#7cc0ff', 38, 5)}`;
+  else if (kind === 'snow') body = `${cloud(300, 150, 1.45, night ? '#a9b4c9' : '#ffffff')}${flakes(14, 2)}`;
+  else if (kind === 'sleet') body = `${cloud(300, 150, 1.45)}${drops(6, '#7cc0ff', 38, 7)}${flakes(7, 4)}`;
+  else if (kind === 'fog')
+    body = `${cloud(330, 140, 1.2, cloudFill, 0.9)}${[205, 245, 285, 325].map((y, i) => `<rect x="${130 + i * 20}" y="${y}" width="${540 - i * 40}" height="16" rx="8" fill="#fff" opacity="${0.75 - i * 0.12}"/>`).join('')}`;
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${c1}"/><stop offset="1" stop-color="${c2}"/></linearGradient></defs><rect width="${W}" height="${H}" fill="url(#g)"/>${body}</svg>`;
+}
+
+async function weatherImage(description) {
+  const kind = weatherKind(description);
+  const hour = new Date(Date.now() + 9 * 3600 * 1000).getUTCHours();
+  const night = hour >= 19 || hour < 6;
+  const key = `${kind}:${night}`;
+  let buf = weatherImageCache.get(key);
+  if (!buf) {
+    buf = await sharp(Buffer.from(weatherSvg(kind, night))).png().toBuffer();
+    weatherImageCache.set(key, buf);
+  }
+  return { kind, buf };
+}
+
+// 날씨 글 + 날씨 그림을 한 번에 보내요. 그림을 못 만들면 글만 보내요.
+async function sendWeather(interaction, description, text) {
+  try {
+    const { kind, buf } = await weatherImage(description);
+    const colors = { clear: 0xffc83d, partly: 0x5aa9ee, overcast: 0x8e99a8, rain: 0x5b8def, shower: 0x5b8def, thunder: 0x6a5acd, snow: 0x9ec9ff, sleet: 0x7f98b5, fog: 0x9aa5b1 };
+    const embed = new EmbedBuilder().setColor(colors[kind] || 0x5aa9ee).setDescription(text).setImage('attachment://weather.png');
+    await interaction.editReply({ content: '', embeds: [embed], files: [new AttachmentBuilder(buf, { name: 'weather.png' })] });
+  } catch (error) {
+    console.error('날씨 그림 전송 실패(글만 보냅니다):', error.message);
+    await interaction.editReply(text);
+  }
 }
 
 const KMA_SKY = { 1: '맑음', 3: '구름많음', 4: '흐림' };
