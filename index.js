@@ -1898,6 +1898,9 @@ const SET_MENU = [
   '`7` 블랙리스트',
   '`8` 방송 알림 보기/삭제 (서버 채널)',
   '`9` 현재 설정 보기',
+  '`10` 추첨 관리 (진행 중인 추첨 종료/취소)',
+  '`11` 문의 티켓 (문의 버튼 패널)',
+  '`12` 아침 브리핑 (매일 날씨·생일 알림)',
   '`0` 종료',
 ].join('\n');
 
@@ -2107,11 +2110,17 @@ async function handleSettingsWizard(interaction) {
           ...Object.entries(SEC_FEATURES).map(([k, v]) => `${c.on[k] ? '🟢 [켜짐]' : '⚫ [꺼짐]'} ${v}`),
           `자동 처벌 ${c.punishMin}분 · 호출어 \`${c.call}\` · 신뢰 ${c.trusted.length}명 · 블랙리스트 ${Object.keys(c.black).length}명`,
           `방송 알림(서버 채널) ${nSubs}개`,
+          `진행 중인 추첨 ${[...giveaways.values()].filter((x) => x.g === guild.id).length}개 · 티켓 ${ticketCfg.get(guild.id) ? '설정됨' : '미설정'} · 아침 브리핑 ${briefCfg.get(guild.id) && briefCfg.get(guild.id).on ? '켜짐' : '꺼짐'}`,
         ].join('\n'),
       );
       return null;
     },
   };
+
+  const wizCtx = { guild, ask, say, botCanSend, firstMentionedChannel };
+  flows[10] = () => wizGiveaways(wizCtx);
+  flows[11] = () => wizTicket(wizCtx);
+  flows[12] = () => wizBrief(wizCtx);
 
   try {
     await interaction.reply({ content: SET_MENU, allowedMentions: { parse: [] } });
@@ -2143,6 +2152,599 @@ async function handleSettingsWizard(interaction) {
     await say('설정 중 오류가 났어요. 다시 `/설정`을 쳐주세요.').catch(() => {});
   } finally {
     settingsActive.delete(key);
+  }
+}
+
+
+// ===== 로블록스 조회 (/로블록스 유저, /로블록스 게임) =====
+// 로블록스 공개 API(로그인·키 필요 없음)로 유저 프로필과 게임 정보(지금 접속자 수 등)를 보여줘요.
+const fmtNum = (n) => Number(n || 0).toLocaleString('ko-KR');
+
+async function rbxJson(url, options = {}) {
+  const res = await fetchWithTimeout(
+    url,
+    { ...options, headers: { Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': BROWSER_UA, ...(options.headers || {}) } },
+    10000,
+  );
+  if (!res.ok) throw new Error(`로블록스 서버 응답 오류 (HTTP ${res.status})`);
+  return res.json();
+}
+
+async function rbxUserEmbed(name) {
+  const found = await rbxJson('https://users.roblox.com/v1/usernames/users', {
+    method: 'POST',
+    body: JSON.stringify({ usernames: [name], excludeBannedUsers: false }),
+  });
+  const u = found.data && found.data[0];
+  if (!u) return null;
+  const [det, friends, followers, followings, thumb] = await Promise.allSettled([
+    rbxJson(`https://users.roblox.com/v1/users/${u.id}`),
+    rbxJson(`https://friends.roblox.com/v1/users/${u.id}/friends/count`),
+    rbxJson(`https://friends.roblox.com/v1/users/${u.id}/followers/count`),
+    rbxJson(`https://friends.roblox.com/v1/users/${u.id}/followings/count`),
+    rbxJson(`https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${u.id}&size=420x420&format=Png`),
+  ]);
+  const d = det.status === 'fulfilled' ? det.value : {};
+  const embed = new EmbedBuilder()
+    .setColor(0xe2231a)
+    .setTitle(`${d.displayName || u.displayName || u.name} (@${u.name})`)
+    .setURL(`https://www.roblox.com/users/${u.id}/profile`);
+  const fields = [];
+  if (d.created) fields.push({ name: '가입일', value: `<t:${Math.floor(new Date(d.created).getTime() / 1000)}:D>`, inline: true });
+  if (friends.status === 'fulfilled') fields.push({ name: '친구', value: fmtNum(friends.value.count), inline: true });
+  if (followers.status === 'fulfilled') fields.push({ name: '팔로워', value: fmtNum(followers.value.count), inline: true });
+  if (followings.status === 'fulfilled') fields.push({ name: '팔로잉', value: fmtNum(followings.value.count), inline: true });
+  fields.push({ name: 'ID', value: String(u.id), inline: true });
+  embed.addFields(fields);
+  if (d.isBanned) embed.setDescription('🚫 정지된 계정이에요.');
+  else if (d.description) embed.setDescription(String(d.description).slice(0, 200));
+  const img = thumb.status === 'fulfilled' && thumb.value.data && thumb.value.data[0] && thumb.value.data[0].imageUrl;
+  if (img) embed.setThumbnail(img);
+  embed.setFooter({ text: 'Roblox' });
+  return embed;
+}
+
+async function rbxGameEmbed(input) {
+  let universeId = null;
+  let hint = null; // 검색 결과에 있는 정보
+  const urlMatch = String(input).match(/roblox\.com\/(?:[a-z]{2}\/)?games\/(\d+)/i);
+  if (urlMatch) {
+    const r = await rbxJson(`https://apis.roblox.com/universes/v1/places/${urlMatch[1]}/universe`);
+    universeId = r.universeId;
+  } else {
+    const q = encodeURIComponent(input);
+    const r = await rbxJson(`https://apis.roblox.com/search-api/omni-search?searchQuery=${q}&sessionId=00000000-0000-0000-0000-000000000000&pageType=all`);
+    const group = (r.searchResults || []).find((g) => g.contentGroupType === 'Game' && g.contents && g.contents[0]);
+    if (group) {
+      hint = group.contents[0];
+      universeId = hint.universeId;
+    }
+  }
+  if (!universeId) return null;
+  const [info, votes, icon] = await Promise.allSettled([
+    rbxJson(`https://games.roblox.com/v1/games?universeIds=${universeId}`),
+    rbxJson(`https://games.roblox.com/v1/games/votes?universeIds=${universeId}`),
+    rbxJson(`https://thumbnails.roblox.com/v1/games/icons?universeIds=${universeId}&size=256x256&format=Png`),
+  ]);
+  const g = info.status === 'fulfilled' && info.value.data && info.value.data[0];
+  if (!g && !hint) return null;
+  const name = (g && g.name) || hint.name;
+  const placeId = (g && g.rootPlaceId) || (hint && hint.rootPlaceId);
+  const playing = g ? g.playing : hint.playerCount;
+  const embed = new EmbedBuilder()
+    .setColor(0xe2231a)
+    .setTitle(String(name).slice(0, 200))
+    .setURL(`https://www.roblox.com/games/${placeId}`)
+    .addFields({ name: '🎮 지금 접속자', value: `${fmtNum(playing)}명`, inline: true });
+  if (g) {
+    embed.addFields(
+      { name: '👀 총 방문', value: fmtNum(g.visits), inline: true },
+      { name: '⭐ 즐겨찾기', value: fmtNum(g.favoritedCount), inline: true },
+    );
+  }
+  const v = votes.status === 'fulfilled' && votes.value.data && votes.value.data[0];
+  const up = v ? v.upVotes : hint && hint.totalUpVotes;
+  const down = v ? v.downVotes : hint && hint.totalDownVotes;
+  if (Number.isFinite(up) && Number.isFinite(down) && up + down > 0) embed.addFields({ name: '👍 좋아요 비율', value: `${Math.round((up / (up + down)) * 100)}%`, inline: true });
+  if (g && g.creator) embed.addFields({ name: '제작자', value: String(g.creator.name || '알 수 없음').slice(0, 50), inline: true });
+  if (g && g.maxPlayers) embed.addFields({ name: '서버당 최대', value: `${g.maxPlayers}명`, inline: true });
+  if (g && g.updated) embed.addFields({ name: '마지막 업데이트', value: `<t:${Math.floor(new Date(g.updated).getTime() / 1000)}:R>`, inline: true });
+  if (hint && hint.ageRecommendationDisplayName) embed.setFooter({ text: `Roblox · ${hint.ageRecommendationDisplayName}` });
+  else embed.setFooter({ text: 'Roblox' });
+  const img = icon.status === 'fulfilled' && icon.value.data && icon.value.data[0] && icon.value.data[0].imageUrl;
+  if (img) embed.setThumbnail(img);
+  return embed;
+}
+
+async function handleRoblox(interaction) {
+  const sub = interaction.options.getSubcommand();
+  const input = interaction.options.getString('이름').trim();
+  await interaction.deferReply();
+  try {
+    const embed = sub === '유저' ? await rbxUserEmbed(input) : await rbxGameEmbed(input);
+    if (!embed) {
+      await interaction.editReply(sub === '유저' ? `"${input}" 유저를 찾지 못했어요. 로블록스 아이디(@뒤의 이름)를 정확히 써주세요.` : `"${input}" 게임을 찾지 못했어요. 게임 이름이나 게임 페이지 주소를 넣어주세요.`);
+      return;
+    }
+    await interaction.editReply({ embeds: [embed] });
+  } catch (error) {
+    console.error('로블록스 조회 오류:', error.message);
+    await interaction.editReply(`로블록스 정보를 가져오지 못했어요. (${error.message}) 잠시 후 다시 시도해주세요.`);
+  }
+}
+
+
+// ===== 추첨 (/추첨) =====
+// /추첨 상품 당첨인원 시간 → 참가 버튼이 달린 글이 올라가고, 시간이 지나면 봇이 알아서 뽑아서 알려줘요.
+// DB가 있으면 giveaways(해시)와 gwp:{글ID}(참가자 집합)에 저장해서 봇이 재시작돼도 이어져요. 끝나면 바로 지워요.
+const giveaways = new Map(); // 글ID -> { g, c, p(상품), n(당첨인원), e(끝나는 시각 ms), h(연 사람) }
+const gwMemParts = new Map(); // DB 없을 때 글ID -> Set(유저ID)
+const MAX_GIVEAWAY_MS = 7 * 86400000;
+
+async function loadGiveaways() {
+  if (!dbEnabled) return;
+  const all = hashToObject(await redis('HGETALL', 'giveaways'));
+  for (const [id, json] of Object.entries(all)) {
+    try {
+      giveaways.set(id, JSON.parse(json));
+    } catch (e) {
+      // 깨진 항목은 무시
+    }
+  }
+  console.log(`🎁 진행 중인 추첨 ${giveaways.size}개를 불러왔어요.`);
+}
+
+async function gwCount(id) {
+  return dbEnabled ? Number(await redis('SCARD', `gwp:${id}`)) || 0 : (gwMemParts.get(id) || new Set()).size;
+}
+async function gwMembers(id) {
+  return dbEnabled ? (await redis('SMEMBERS', `gwp:${id}`)) || [] : [...(gwMemParts.get(id) || [])];
+}
+
+function gwEmbed(meta, count, result) {
+  const embed = new EmbedBuilder().setColor(result ? 0x95a5a6 : 0xf1c40f).setTitle(`🎁 ${meta.p}`.slice(0, 250));
+  if (!result) {
+    embed.setDescription(`아래 **🎉 참가** 버튼을 눌러 참가하세요! (다시 누르면 취소돼요)\n\n⏰ 마감: <t:${Math.floor(meta.e / 1000)}:R> (<t:${Math.floor(meta.e / 1000)}:f>)\n🏆 당첨 인원: ${meta.n}명\n🙋 참가자: **${count}명**`);
+  } else {
+    embed.setDescription(`추첨이 끝났어요!\n\n🏆 당첨: ${result.winners.length ? result.winners.map((u) => `<@${u}>`).join(', ') : '참가자가 없어서 당첨자가 없어요'}\n🙋 참가자: ${result.total}명`);
+  }
+  embed.setFooter({ text: `주최: ${meta.hn || '관리자'}` });
+  return embed;
+}
+function gwRow(disabled) {
+  return new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('gw_join').setLabel('참가').setEmoji('🎉').setStyle(ButtonStyle.Primary).setDisabled(Boolean(disabled)));
+}
+
+async function startGiveaway(interaction) {
+  const prize = interaction.options.getString('상품').trim().slice(0, 200);
+  const winners = interaction.options.getInteger('당첨인원');
+  const ms = parseDuration(interaction.options.getString('시간'));
+  if (!ms || ms < 60000 || ms > MAX_GIVEAWAY_MS) {
+    await interaction.reply({ content: '시간은 1분 ~ 7일 사이로 써주세요. 예: `30분`, `2시간`, `1일`', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const me = interaction.guild.members.me;
+  const p = me && interaction.channel.permissionsFor(me);
+  if (!p || !p.has(PermissionFlagsBits.ViewChannel) || !p.has(PermissionFlagsBits.SendMessages)) {
+    await interaction.reply({ content: '봇이 이 채널에서 글을 쓸 수 없어요. 봇 역할에 "채널 보기"와 "메시지 보내기" 권한을 주세요.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const meta = { g: interaction.guildId, c: interaction.channelId, p: prize, n: winners, e: Date.now() + ms, hn: interaction.user.username };
+  await interaction.reply({ embeds: [gwEmbed(meta, 0)], components: [gwRow(false)] });
+  const msg = await interaction.fetchReply();
+  giveaways.set(msg.id, meta);
+  if (dbEnabled) await redis('HSET', 'giveaways', msg.id, JSON.stringify(meta));
+  else gwMemParts.set(msg.id, new Set());
+}
+
+async function gwJoin(interaction) {
+  const id = interaction.message.id;
+  const meta = giveaways.get(id);
+  if (!meta) {
+    await interaction.reply({ content: '이미 끝났거나 찾을 수 없는 추첨이에요.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (Date.now() >= meta.e) {
+    await interaction.reply({ content: '이미 마감된 추첨이에요. 곧 결과가 나와요!', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const uid = interaction.user.id;
+  let joined;
+  if (dbEnabled) {
+    const has = Number(await redis('SISMEMBER', `gwp:${id}`, uid)) === 1;
+    await redis(has ? 'SREM' : 'SADD', `gwp:${id}`, uid);
+    joined = !has;
+  } else {
+    const set = gwMemParts.get(id) || new Set();
+    gwMemParts.set(id, set);
+    joined = !set.has(uid);
+    if (joined) set.add(uid);
+    else set.delete(uid);
+  }
+  const count = await gwCount(id);
+  await interaction.update({ embeds: [gwEmbed(meta, count)], components: [gwRow(false)] });
+  interaction.followUp({ content: joined ? '🎉 참가했어요! 행운을 빌어요.' : '참가를 취소했어요.', flags: MessageFlags.Ephemeral }).catch(() => {});
+}
+
+// 추첨을 끝내고 당첨자를 뽑아요. cancel=true면 뽑지 않고 취소해요.
+async function finishGiveaway(id, cancel) {
+  const meta = giveaways.get(id);
+  if (!meta) return false;
+  giveaways.delete(id); // 먼저 지워서 두 번 뽑히지 않게
+  let members = [];
+  try {
+    members = cancel ? [] : await gwMembers(id);
+  } catch (e) {
+    console.error('추첨 참가자 불러오기 실패:', e.message);
+  }
+  const pool = [...members];
+  const picked = [];
+  while (picked.length < meta.n && pool.length) picked.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+  try {
+    if (dbEnabled) {
+      await redis('HDEL', 'giveaways', id);
+      await redis('DEL', `gwp:${id}`);
+    }
+    gwMemParts.delete(id);
+  } catch (e) {
+    console.error('추첨 기록 삭제 실패:', e.message);
+  }
+  try {
+    const channel = await client.channels.fetch(meta.c);
+    const msg = await channel.messages.fetch(id).catch(() => null);
+    if (cancel) {
+      if (msg) await msg.edit({ embeds: [new EmbedBuilder().setColor(0x95a5a6).setTitle(`🎁 ${meta.p}`.slice(0, 250)).setDescription('관리자가 추첨을 취소했어요.')], components: [gwRow(true)] });
+      return true;
+    }
+    const result = { winners: picked, total: members.length };
+    if (msg) await msg.edit({ embeds: [gwEmbed(meta, members.length, result)], components: [gwRow(true)] });
+    await channel.send({
+      content: picked.length ? `🎉 **${meta.p}** 추첨 결과! 당첨을 축하해요 ${picked.map((u) => `<@${u}>`).join(', ')}` : `😢 **${meta.p}** 추첨에 참가한 사람이 없어서 당첨자가 없어요.`,
+      allowedMentions: { users: picked },
+      reply: msg ? { messageReference: id, failIfNotExists: false } : undefined,
+    });
+  } catch (error) {
+    console.error('추첨 결과 전송 오류:', error.message);
+  }
+  return true;
+}
+
+let gwTickRunning = false;
+async function checkGiveaways() {
+  if (gwTickRunning || !client.isReady()) return;
+  gwTickRunning = true;
+  try {
+    const now = Date.now();
+    for (const [id, meta] of [...giveaways]) if (meta.e <= now) await finishGiveaway(id, false);
+  } finally {
+    gwTickRunning = false;
+  }
+}
+
+// ===== 문의 티켓 =====
+// /설정 → 11번에서 담당자 역할과 패널 채널을 정하면 "문의하기" 버튼 패널이 올라가요.
+// 누르면 그 사람과 담당자만 볼 수 있는 비공개 채널이 만들어지고, "닫기" 버튼으로 지워요. 한 사람당 1개만 열 수 있어요.
+const ticketCfg = new Map(); // guildId -> { role, cat }
+async function getTicketCfg(g) {
+  if (ticketCfg.has(g)) return ticketCfg.get(g);
+  let cfg = null;
+  if (dbEnabled) {
+    try {
+      const raw = await redis('GET', `ticket:${g}`);
+      if (raw) cfg = JSON.parse(raw);
+    } catch (e) {
+      console.error('티켓 설정 불러오기 실패:', e.message);
+    }
+  }
+  ticketCfg.set(g, cfg);
+  return cfg;
+}
+async function saveTicketCfg(g, cfg) {
+  ticketCfg.set(g, cfg);
+  if (!dbEnabled) return;
+  if (cfg) await redis('SET', `ticket:${g}`, JSON.stringify(cfg));
+  else await redis('DEL', `ticket:${g}`);
+}
+
+function ticketPanel() {
+  return {
+    embeds: [new EmbedBuilder().setColor(0x57f287).setTitle('📩 문의하기').setDescription('도움이 필요하면 아래 버튼을 눌러주세요.\n나와 담당자만 볼 수 있는 비공개 채널이 만들어져요.')],
+    components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('tk_open').setLabel('문의하기').setEmoji('📩').setStyle(ButtonStyle.Success))],
+  };
+}
+
+async function ticketOpen(interaction) {
+  const guild = interaction.guild;
+  const cfg = await getTicketCfg(guild.id);
+  if (!cfg) {
+    await interaction.reply({ content: '티켓 설정이 아직 안 되어 있어요. 관리자에게 알려주세요.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const uid = interaction.user.id;
+  const existing = guild.channels.cache.find((c) => c.topic === `ticket:${uid}`);
+  if (existing) {
+    await interaction.reply({ content: `이미 열려 있는 문의가 있어요 → <#${existing.id}>`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const me = guild.members.me;
+  if (!me || !me.permissions.has(PermissionFlagsBits.ManageChannels)) {
+    await interaction.reply({ content: '봇에 "채널 관리" 권한이 없어서 문의 채널을 만들 수 없어요. 관리자에게 알려주세요.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  try {
+    const allow = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.AttachFiles];
+    const overwrites = [
+      { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+      { id: uid, allow },
+      { id: client.user.id, allow: [...allow, PermissionFlagsBits.ManageChannels] },
+    ];
+    if (cfg.role && guild.roles.cache.has(cfg.role)) overwrites.push({ id: cfg.role, allow });
+    const safe = interaction.user.username.toLowerCase().replace(/[^a-z0-9가-힣]/g, '').slice(0, 20) || 'user';
+    const parent = cfg.cat && guild.channels.cache.get(cfg.cat) ? cfg.cat : undefined;
+    const ch = await guild.channels.create({
+      name: `문의-${safe}`,
+      type: ChannelType.GuildText,
+      parent,
+      topic: `ticket:${uid}`,
+      permissionOverwrites: overwrites,
+      reason: `문의 티켓: ${interaction.user.tag}`,
+    });
+    await ch.send({
+      content: `<@${uid}>님, 문의 내용을 편하게 남겨주세요.${cfg.role ? ` <@&${cfg.role}> 담당자가 곧 확인할 거예요.` : ''}\n다 끝나면 아래 **닫기** 버튼을 눌러주세요.`,
+      components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('tk_close').setLabel('닫기').setEmoji('🔒').setStyle(ButtonStyle.Danger))],
+      allowedMentions: { users: [uid], roles: cfg.role ? [cfg.role] : [] },
+    });
+    await interaction.editReply(`✅ 문의 채널을 만들었어요 → <#${ch.id}>`);
+  } catch (error) {
+    console.error('티켓 생성 오류:', error.message);
+    await interaction.editReply('문의 채널을 만들지 못했어요. 봇 권한(채널 관리)을 확인해주세요.');
+  }
+}
+
+async function ticketClose(interaction) {
+  const ch = interaction.channel;
+  const m = /^ticket:(\d+)$/.exec(ch.topic || '');
+  if (!m) {
+    await interaction.reply({ content: '문의 채널이 아니에요.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const cfg = await getTicketCfg(interaction.guildId);
+  const isStaff = (cfg && cfg.role && interaction.member.roles.cache.has(cfg.role)) || interaction.memberPermissions.has(PermissionFlagsBits.ManageChannels);
+  if (interaction.user.id !== m[1] && !isStaff) {
+    await interaction.reply({ content: '문의를 연 사람이나 담당자만 닫을 수 있어요.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.reply('🔒 5초 뒤에 이 채널을 지워요.');
+  setTimeout(() => ch.delete('문의 티켓 닫힘').catch((e) => console.error('티켓 삭제 실패:', e.message)), 5000);
+}
+
+// ===== 아침 브리핑 =====
+// /설정 → 12번에서 켜면 매일 정한 시각(한국 시간)에 날씨 + 오늘 날짜 + 오늘 생일인 사람을 알림 채널에 보내줘요.
+const briefCfg = new Map(); // guildId -> { on, ch, region, time:'HH:MM', last }
+async function getBrief(g) {
+  if (briefCfg.has(g)) return briefCfg.get(g);
+  let cfg = null;
+  if (dbEnabled) {
+    try {
+      const raw = await redis('GET', `brief:${g}`);
+      if (raw) cfg = JSON.parse(raw);
+    } catch (e) {
+      console.error('아침 브리핑 설정 불러오기 실패:', e.message);
+    }
+  }
+  cfg = { on: false, ch: null, region: '청주', time: '08:00', last: '', ...(cfg || {}) };
+  briefCfg.set(g, cfg);
+  return cfg;
+}
+async function saveBrief(g) {
+  if (dbEnabled) await redis('SET', `brief:${g}`, JSON.stringify(briefCfg.get(g)));
+}
+
+async function buildBriefing(guild, cfg) {
+  const now = kstNow();
+  const dow = ['일', '월', '화', '수', '목', '금', '토'][new Date(Date.UTC(now.y, now.m - 1, now.d)).getUTCDay()];
+  const lines = [`☀️ **좋은 아침이에요!** ${now.m}월 ${now.d}일 (${dow})`];
+  let weather = null;
+  try {
+    if (KMA_API_KEY) {
+      const w = await kmaWeather(cfg.region);
+      if (!w.error) {
+        weather = w.description;
+        lines.push(`📍 ${w.label}: **${w.description}** · 현재 ${w.temp}°C${w.tmx !== undefined ? ` (최고 ${Math.round(w.tmx)}° / 최저 ${Math.round(w.tmn)}°)` : ''}${w.popMax !== null ? ` · ☔ 강수확률 ${w.popMax}%` : ''}`);
+      }
+    } else {
+      const res = await fetchWithTimeout(`https://wttr.in/${encodeURIComponent(cfg.region)}?format=j1&lang=ko`);
+      if (res.ok) {
+        const data = await res.json();
+        const cur = data.current_condition[0];
+        weather = (cur.lang_ko && cur.lang_ko[0] && cur.lang_ko[0].value) || cur.weatherDesc[0].value;
+        lines.push(`📍 ${cfg.region}: **${weather}** · 현재 ${cur.temp_C}°C (최고 ${data.weather[0].maxtempC}° / 최저 ${data.weather[0].mintempC}°)`);
+      }
+    }
+  } catch (e) {
+    console.error('브리핑 날씨 실패:', e.message);
+  }
+  if (!weather) lines.push('🌫️ 날씨 정보를 가져오지 못했어요.');
+  const todayKeys = [`${pad2(now.m)}-${pad2(now.d)}`];
+  if (now.m === 2 && now.d === 28 && !isLeapYear(now.y)) todayKeys.push('02-29');
+  let bdays = [];
+  if (dbEnabled) {
+    try {
+      const b = hashToObject(await redis('HGETALL', `birthdays:${guild.id}`));
+      bdays = Object.keys(b).filter((id) => todayKeys.includes(b[id]));
+    } catch (e) {
+      console.error('브리핑 생일 조회 실패:', e.message);
+    }
+  }
+  if (bdays.length) lines.push(`🎂 오늘 생일: ${bdays.map((id) => `<@${id}>`).join(', ')}`);
+  lines.push('', '오늘도 좋은 하루 보내세요! 💪');
+  return { text: lines.join('\n'), weather, bdays };
+}
+
+async function sendBriefing(guild, cfg) {
+  const channel = (cfg.ch && guild.channels.cache.get(cfg.ch)) || pickAnnounceChannel(guild);
+  if (!channel) return false;
+  const { text, weather, bdays } = await buildBriefing(guild, cfg);
+  const payload = { content: text, allowedMentions: { users: bdays } };
+  if (weather) {
+    try {
+      const { buf } = await weatherImage(weather);
+      payload.files = [new AttachmentBuilder(buf, { name: 'weather.png' })];
+    } catch (e) {
+      console.error('브리핑 날씨 그림 실패:', e.message);
+    }
+  }
+  await channel.send(payload);
+  return true;
+}
+
+let briefRunning = false;
+async function checkBriefings() {
+  if (briefRunning || !client.isReady()) return;
+  briefRunning = true;
+  try {
+    const now = kstNow();
+    const nowMin = now.h * 60 + new Date(Date.now() + 9 * 3600000).getUTCMinutes();
+    const dateKey = `${now.y}-${pad2(now.m)}-${pad2(now.d)}`;
+    for (const guild of client.guilds.cache.values()) {
+      const cfg = await getBrief(guild.id);
+      if (!cfg.on || cfg.last === dateKey) continue;
+      const [h, mi] = cfg.time.split(':').map(Number);
+      const target = h * 60 + mi;
+      if (nowMin < target || nowMin > target + 180) continue; // 늦게 깨어나도 3시간까지는 보내요
+      cfg.last = dateKey; // 실패해도 도배하지 않게 먼저 표시
+      try {
+        await saveBrief(guild.id);
+        await sendBriefing(guild, cfg);
+      } catch (e) {
+        console.error(`아침 브리핑 오류 (서버: ${guild.name}):`, e.message);
+      }
+    }
+  } finally {
+    briefRunning = false;
+  }
+}
+
+// ---- /설정 도우미에서 부르는 흐름 (10: 추첨, 11: 티켓, 12: 아침 브리핑) ----
+async function wizGiveaways({ guild, ask, say }) {
+  const list = [...giveaways].filter(([, m]) => m.g === guild.id);
+  if (!list.length) {
+    await say('🎁 진행 중인 추첨이 없어요. 추첨은 `/추첨`으로 시작해요.');
+    return null;
+  }
+  const lines = list.map(([id, m], i) => `\`${i + 1}\` **${m.p}** — 당첨 ${m.n}명 · 마감 <t:${Math.floor(m.e / 1000)}:R> · <#${m.c}>`);
+  const m = await ask(`🎁 **진행 중인 추첨**\n${lines.join('\n')}\n\`종료 1\` = 지금 바로 뽑기 · \`취소 1\` = 뽑지 않고 취소 · \`0\` = 돌아가기`);
+  if (!m) return 'timeout';
+  const mm = /^(종료|취소)\s*(\d+)$/.exec(m.content.trim());
+  if (!mm || !list[Number(mm[2]) - 1]) {
+    if (m.content.trim() !== '0') await say('`종료 1`, `취소 1`처럼 보내주세요.');
+    return null;
+  }
+  await finishGiveaway(list[Number(mm[2]) - 1][0], mm[1] === '취소');
+  await say(mm[1] === '취소' ? '✅ 추첨을 취소했어요.' : '✅ 추첨을 마쳤어요. 결과는 추첨 글 채널에 올라가요.');
+  return null;
+}
+
+async function wizTicket({ guild, ask, say, firstMentionedChannel: fmc, botCanSend }) {
+  const cfg = await getTicketCfg(guild.id);
+  const m = await ask(
+    `📩 **문의 티켓** — 지금: ${cfg ? `담당자 ${cfg.role ? `<@&${cfg.role}>` : '없음'}` : '설정 안 됨'}\n\`1\` 새로 설정하고 패널 올리기\n\`2\` 설정 해제 (이미 올린 패널 글은 직접 지워주세요)\n\`0\` 돌아가기`,
+  );
+  if (!m) return 'timeout';
+  const t = m.content.trim();
+  if (t === '2') {
+    await saveTicketCfg(guild.id, null);
+    await say('✅ 티켓 설정을 풀었어요.');
+    return null;
+  }
+  if (t !== '1') return null;
+  const me = guild.members.me;
+  if (!me || !me.permissions.has(PermissionFlagsBits.ManageChannels)) {
+    await say('⚠️ 봇에 "채널 관리" 권한이 없어요. 서버 설정 → 역할에서 봇 역할에 "채널 관리"를 준 뒤 다시 해주세요.');
+    return null;
+  }
+  const r = await ask('① 문의를 처리할 **담당자 역할**을 @멘션으로 보내주세요. (없으면 `없음`)');
+  if (!r) return 'timeout';
+  const rid = (/<@&(\d+)>/.exec(r.content) || [])[1];
+  if (!rid && r.content.trim() !== '없음') {
+    await say('역할을 못 찾았어요. `@역할이름` 모양으로 멘션해주세요. 처음부터 다시 해주세요.');
+    return null;
+  }
+  const c = await ask('② 문의 채널을 만들 **카테고리 이름**을 보내주세요. (없으면 `없음`)');
+  if (!c) return 'timeout';
+  let cat = null;
+  if (c.content.trim() !== '없음') {
+    const found = guild.channels.cache.find((x) => x.type === ChannelType.GuildCategory && x.name === c.content.trim());
+    if (!found) {
+      await say('그 이름의 카테고리를 못 찾았어요. 이름을 정확히 써주세요. 처음부터 다시 해주세요.');
+      return null;
+    }
+    cat = found.id;
+  }
+  const p = await ask('③ "문의하기" 버튼 패널을 올릴 **채널**을 #멘션으로 보내주세요.');
+  if (!p) return 'timeout';
+  const ch = fmc(p);
+  if (!ch) {
+    await say('채널을 못 찾았어요. 처음부터 다시 해주세요.');
+    return null;
+  }
+  if (!botCanSend(ch)) {
+    await say(`봇이 <#${ch.id}> 채널에서 글을 쓸 수 없어요. 권한을 준 뒤 다시 해주세요.`);
+    return null;
+  }
+  await saveTicketCfg(guild.id, { role: rid || null, cat });
+  await ch.send(ticketPanel());
+  await say(`✅ 설정 완료! <#${ch.id}>에 문의 패널을 올렸어요.`);
+  return null;
+}
+
+async function wizBrief({ guild, ask, say, firstMentionedChannel: fmc, botCanSend }) {
+  const cfg = await getBrief(guild.id);
+  for (;;) {
+    const m = await ask(
+      `☀️ **아침 브리핑** — ${cfg.on ? '🟢 [켜짐]' : '⚫ [꺼짐]'}\n채널: ${cfg.ch ? `<#${cfg.ch}>` : '알림 채널'} · 지역: ${cfg.region} · 시간: 매일 ${cfg.time} (한국 시간)\n\`1\` 켜기/끄기\n\`2\` 채널 정하기\n\`3\` 지역 정하기\n\`4\` 시간 정하기\n\`5\` 지금 미리보기 보내기\n\`0\` 돌아가기`,
+    );
+    if (!m) return 'timeout';
+    const t = m.content.trim();
+    if (t === '0') return null;
+    if (t === '1') {
+      cfg.on = !cfg.on;
+      if (cfg.on && !dbEnabled) await say('ℹ️ DB가 없어서 봇이 재시작되면 이 설정이 사라져요.');
+      await saveBrief(guild.id);
+    } else if (t === '2') {
+      const a = await ask('채널을 #멘션으로 보내주세요. (알림 채널로 되돌리려면 `해제`)');
+      if (!a) return 'timeout';
+      if (a.content.trim() === '해제') cfg.ch = null;
+      else {
+        const ch = fmc(a);
+        if (!ch) await say('채널을 못 찾았어요.');
+        else if (!botCanSend(ch)) await say('봇이 그 채널에서 글을 쓸 수 없어요.');
+        else cfg.ch = ch.id;
+      }
+      await saveBrief(guild.id);
+    } else if (t === '3') {
+      const a = await ask('날씨 지역을 보내주세요. 예: `청주`, `서울 강남구`');
+      if (!a) return 'timeout';
+      cfg.region = a.content.trim().slice(0, 30) || cfg.region;
+      await saveBrief(guild.id);
+    } else if (t === '4') {
+      const a = await ask('시간을 보내주세요. 예: `8:30`, `7시`, `07:00` (한국 시간)');
+      if (!a) return 'timeout';
+      const mm = /^(\d{1,2})(?::(\d{2})|시)?$/.exec(a.content.trim());
+      if (!mm || Number(mm[1]) > 23 || Number(mm[2] || 0) > 59) await say('시간 모양을 확인해주세요. 예: `8:30`');
+      else {
+        cfg.time = `${pad2(Number(mm[1]))}:${mm[2] || '00'}`;
+        await saveBrief(guild.id);
+      }
+    } else if (t === '5') {
+      try {
+        const ok = await sendBriefing(guild, cfg);
+        if (!ok) await say('브리핑을 보낼 채널이 없어요. 2번으로 채널을 정해주세요.');
+      } catch (e) {
+        await say(`미리보기를 보내지 못했어요. (${e.message})`);
+      }
+    } else await say('메뉴에 있는 번호를 보내주세요.');
   }
 }
 
@@ -2442,6 +3044,18 @@ const commands = [
         .addChoices({ name: '유튜브', value: 'youtube' }, { name: 'SOOP(숲)', value: 'soop' }),
     )
     .addStringOption((option) => option.setName('검색어').setDescription('원하는 주제가 있으면 입력 (예: 로블록스, 게임)').setMaxLength(30)),
+  new SlashCommandBuilder()
+    .setName('로블록스')
+    .setDescription('로블록스 유저나 게임 정보를 보여줘요')
+    .addSubcommand((sub) => sub.setName('유저').setDescription('로블록스 유저 정보').addStringOption((o) => o.setName('이름').setDescription('로블록스 아이디').setRequired(true)))
+    .addSubcommand((sub) => sub.setName('게임').setDescription('로블록스 게임 정보 (지금 접속자 수 등)').addStringOption((o) => o.setName('이름').setDescription('게임 이름 또는 게임 페이지 주소').setRequired(true))),
+  new SlashCommandBuilder()
+    .setName('추첨')
+    .setDescription('참가 버튼으로 추첨을 열어요 (관리자 전용)')
+    .addStringOption((o) => o.setName('상품').setDescription('무엇을 뽑나요?').setRequired(true))
+    .addIntegerOption((o) => o.setName('당첨인원').setDescription('몇 명을 뽑나요? (1~20)').setMinValue(1).setMaxValue(20).setRequired(true))
+    .addStringOption((o) => o.setName('시간').setDescription('언제까지? 예: 30분, 2시간, 1일 (최대 7일)').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map((command) => command.toJSON());
 
 async function registerCommandsForGuild(guildId) {
@@ -2470,6 +3084,7 @@ client.once(Events.ClientReady, async (c) => {
       await loadSec(guild.id);
     }
     console.log('🗄️ DB(Upstash Redis) 연결됨: 저장된 서버 설정을 불러왔어요.');
+    await loadGiveaways().catch((e) => console.error('추첨 불러오기 실패:', e.message));
     setInterval(() => checkReminders().catch((e) => console.error(e.message)), 60 * 1000);
     setInterval(() => checkBirthdays().catch((e) => console.error(e.message)), 60 * 1000);
     loadStreams()
@@ -2486,6 +3101,9 @@ client.once(Events.ClientReady, async (c) => {
   } else {
     console.log('ℹ️ UPSTASH_REDIS_REST_URL/TOKEN이 없어서 DB를 쓰지 않아요. (설정은 메모리 저장, 생일·리마인더 기능은 꺼짐)');
   }
+  // 추첨·아침 브리핑은 DB가 없어도 (메모리로) 돌아가요
+  setInterval(() => checkGiveaways().catch((e) => console.error(e.message)), 30 * 1000);
+  setInterval(() => checkBriefings().catch((e) => console.error(e.message)), 60 * 1000);
 });
 
 client.on(Events.GuildAuditLogEntryCreate, (entry, guild) => {
@@ -2550,6 +3168,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   }
 
+
+  if (interaction.isButton() && interaction.customId === 'gw_join') {
+    if (!interaction.inGuild()) return;
+    await gwJoin(interaction).catch((e) => console.error('추첨 참가 오류:', e.message));
+    return;
+  }
+  if (interaction.isButton() && interaction.customId === 'tk_open') {
+    if (!interaction.inGuild()) return;
+    await ticketOpen(interaction).catch((e) => console.error('티켓 오류:', e.message));
+    return;
+  }
+  if (interaction.isButton() && interaction.customId === 'tk_close') {
+    if (!interaction.inGuild()) return;
+    await ticketClose(interaction).catch((e) => console.error('티켓 닫기 오류:', e.message));
+    return;
+  }
 
   if (interaction.isButton() && interaction.customId.startsWith('br31_')) {
     if (!interaction.inGuild()) return;
@@ -2841,6 +3475,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
         `🔤 끝말잇기를 종료합니다. 총 ${game.usedWords.size}개의 단어가 나왔어요!`,
       );
     }
+    return;
+  }
+
+  if (interaction.commandName === '로블록스') {
+    await handleRoblox(interaction);
+    return;
+  }
+
+  if (interaction.commandName === '추첨') {
+    await startGiveaway(interaction);
     return;
   }
 
