@@ -3056,6 +3056,31 @@ const commands = [
     .addIntegerOption((o) => o.setName('당첨인원').setDescription('몇 명을 뽑나요? (1~20)').setMinValue(1).setMaxValue(20).setRequired(true))
     .addStringOption((o) => o.setName('시간').setDescription('언제까지? 예: 30분, 2시간, 1일 (최대 7일)').setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder()
+    .setName('정기배송알림')
+    .setDescription('택배를 등록하면 정한 시간마다 DM으로 배송 상태를 알려줘요')
+    .addSubcommand((sub) =>
+      sub
+        .setName('등록')
+        .setDescription('택배사·운송장번호·알림 시간을 등록해요 (틀리면 등록 안 돼요)')
+        .addStringOption((o) => o.setName('택배사').setDescription('택배사를 고르세요').setRequired(true)
+        .addChoices(
+          { name: 'CJ대한통운', value: 'cjkoreaexpress' },
+          { name: '우체국택배', value: 'koreapost' },
+          { name: '한진택배', value: 'hanjin' },
+          { name: '롯데택배', value: 'lotte' },
+          { name: '로젠택배', value: 'logen' },
+          { name: '경동택배', value: 'kyungdong' },
+          { name: 'GS25 편의점택배', value: 'gspostbox' },
+          { name: 'CU 편의점택배', value: 'cupost' },
+          { name: 'LX판토스', value: 'pantos' },
+          { name: '린코스', value: 'rincos' },
+        ))
+        .addStringOption((o) => o.setName('운송장번호').setDescription('운송장번호 (하이픈 없이)').setRequired(true).setMaxLength(30))
+        .addStringOption((o) => o.setName('시간').setDescription('매일 알릴 시각, 최대 4개 (한국 시간). 예: 9 또는 9, 13, 18').setRequired(true).setMaxLength(40)),
+    )
+    .addSubcommand((sub) => sub.setName('목록').setDescription('내 정기 배송 알림 보기'))
+    .addSubcommand((sub) => sub.setName('삭제').setDescription('정기 배송 알림 지우기').addIntegerOption((o) => o.setName('번호').setDescription('목록의 번호').setMinValue(1).setMaxValue(10).setRequired(true))),
 ].map((command) => command.toJSON());
 
 async function registerCommandsForGuild(guildId) {
@@ -3084,6 +3109,7 @@ client.once(Events.ClientReady, async (c) => {
       await loadSec(guild.id);
     }
     console.log('🗄️ DB(Upstash Redis) 연결됨: 저장된 서버 설정을 불러왔어요.');
+    await loadParcelAlerts().catch((e) => console.error('정기 배송 알림 불러오기 실패:', e.message));
     await loadGiveaways().catch((e) => console.error('추첨 불러오기 실패:', e.message));
     setInterval(() => checkReminders().catch((e) => console.error(e.message)), 60 * 1000);
     setInterval(() => checkBirthdays().catch((e) => console.error(e.message)), 60 * 1000);
@@ -3102,6 +3128,7 @@ client.once(Events.ClientReady, async (c) => {
     console.log('ℹ️ UPSTASH_REDIS_REST_URL/TOKEN이 없어서 DB를 쓰지 않아요. (설정은 메모리 저장, 생일·리마인더 기능은 꺼짐)');
   }
   // 추첨·아침 브리핑은 DB가 없어도 (메모리로) 돌아가요
+  setInterval(() => checkParcelAlerts().catch((e) => console.error(e.message)), 60 * 1000);
   setInterval(() => checkGiveaways().catch((e) => console.error(e.message)), 30 * 1000);
   setInterval(() => checkBriefings().catch((e) => console.error(e.message)), 60 * 1000);
 });
@@ -3155,6 +3182,18 @@ client.on(Events.Warn, (message) => console.warn('⚠️ 디스코드 경고:', 
 client.on(Events.InteractionCreate, async (interaction) => {
  try {
   if (interaction.isChatInputCommand()) {
+    // 디스코드가 이 서버(IP)의 "응답 수정" 요청을 429로 막는 경우가 있어요. 그땐 결과를 DM으로 대신 보내요.
+    const origEditReply = interaction.editReply.bind(interaction);
+    interaction.editReply = async (options) => {
+      try {
+        return await origEditReply(options);
+      } catch (error) {
+        if (error.status !== 429 && !/429|rate ?limit/i.test(String(error.message))) throw error;
+        console.error('⚠️ 응답 수정이 429로 막혀서 DM으로 대신 보냈어요.');
+        const body = typeof options === 'string' ? { content: options } : { ...options, flags: undefined };
+        return interaction.user.send(body).catch((e) => console.error('DM 대체 전송도 실패:', e.message));
+      }
+    };
     // 인터랙션이 디스코드에서 생성된 시각과 지금(핸들러 진입 시각)의 차이를 잽니다.
     // 이 값이 이미 2~3초를 넘으면, 봇 코드 문제가 아니라 서버가 잠들어있다가
     // 늦게 깨어난 것(콜드 스타트)이 원인이라는 뜻입니다.
@@ -3480,6 +3519,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   if (interaction.commandName === '로블록스') {
     await handleRoblox(interaction);
+    return;
+  }
+
+  if (interaction.commandName === '정기배송알림') {
+    await handleParcelAlert(interaction);
     return;
   }
 
@@ -4322,6 +4366,208 @@ function formatParcelTime(raw) {
   const k = new Date(d.getTime() + 9 * 3600 * 1000);
   const pad = (n) => String(n).padStart(2, '0');
   return `${k.getUTCFullYear()}-${pad(k.getUTCMonth() + 1)}-${pad(k.getUTCDate())} ${pad(k.getUTCHours())}:${pad(k.getUTCMinutes())}`;
+}
+
+// ===== 정기 배송 알림 (/정기배송알림) — 알림은 무조건 DM으로만 와요 =====
+// 택배사 + 운송장번호 + 알림 시간(예: 9시, 13시, 18시)을 등록하면, 그 시각마다 배송 상태를 DM으로 보내줘요.
+// 등록할 때 실제로 조회해서 확인하기 때문에, 택배사나 운송장번호가 맞지 않으면 등록이 안 돼요. 배송 완료되면 알아서 지워져요.
+// DB가 있으면 Redis 해시 parcelalerts(유저ID -> JSON 목록)에 저장해요. 완료·삭제되면 지워서 용량을 아껴요.
+const PARCEL_ALERT_MAX_PER_USER = 3;
+const PARCEL_ALERT_MAX_TIMES = 4;
+const PARCEL_ALERT_LIFETIME_MS = 30 * 86400000;
+const parcelAlerts = new Map(); // userId -> [ { c, n, t:['09:00'], s:{ '09:00':'2026-11-28' }, f:0, at } ]
+
+async function loadParcelAlerts() {
+  if (!dbEnabled) return;
+  const all = hashToObject(await redis('HGETALL', 'parcelalerts'));
+  for (const [uid, json] of Object.entries(all)) {
+    try {
+      const list = JSON.parse(json);
+      if (Array.isArray(list) && list.length) parcelAlerts.set(uid, list);
+    } catch (e) {
+      // 깨진 항목은 무시
+    }
+  }
+  console.log(`📦 정기 배송 알림 ${[...parcelAlerts.values()].reduce((a, l) => a + l.length, 0)}건을 불러왔어요.`);
+}
+async function saveParcelAlerts(uid) {
+  const list = parcelAlerts.get(uid) || [];
+  if (!list.length) parcelAlerts.delete(uid);
+  if (!dbEnabled) return;
+  if (list.length) await redis('HSET', 'parcelalerts', uid, JSON.stringify(list));
+  else await redis('HDEL', 'parcelalerts', uid);
+}
+
+// "9, 13, 18:30" / "9시 13시" -> ['09:00','13:00','18:30'] (잘못되면 null)
+function parseAlertTimes(input) {
+  const out = [];
+  for (const tok of String(input).trim().split(/[,\s]+/).filter(Boolean)) {
+    const m = /^(\d{1,2})(?::(\d{2})|시)?$/.exec(tok);
+    if (!m || Number(m[1]) > 23 || Number(m[2] || 0) > 59) return null;
+    out.push(`${pad2(Number(m[1]))}:${m[2] || '00'}`);
+  }
+  const uniq = [...new Set(out)].sort();
+  return uniq.length && uniq.length <= PARCEL_ALERT_MAX_TIMES ? uniq : null;
+}
+
+async function parcelStatusPayload(courierCode, number, result) {
+  const checkpoints = [...(result.checkpoints || [])];
+  const times = checkpoints.map((c) => Date.parse(c.time));
+  if (times.every((t) => !Number.isNaN(t))) checkpoints.sort((a, b) => Date.parse(b.time) - Date.parse(a.time));
+  else checkpoints.reverse();
+  const recent = checkpoints.slice(0, 3).map((c) => `**${formatParcelTime(c.time) || '시간 미상'}**${c.location ? ` · ${c.location}` : ''}\n${String(c.message || '').trim()}`);
+  const delivered = Boolean(result.status === 'Delivered' || result.delivered);
+  const embed = new EmbedBuilder()
+    .setTitle(`📦 ${PARCEL_COURIERS[courierCode] || courierCode} ${number}`)
+    .setColor(delivered ? 0x2ecc71 : 0x3498db)
+    .setDescription(`**현재 상태: ${result.statusLabel || PARCEL_STATUS_LABEL[result.status] || result.status || '확인 중'}**\n\n${recent.join('\n\n')}`.slice(0, 4000));
+  const payload = { embeds: [embed] };
+  try {
+    payload.files = [new AttachmentBuilder(await parcelStepImage(parcelStepIndex(result, checkpoints)), { name: 'step.png' })];
+    embed.setImage('attachment://step.png');
+  } catch (e) {
+    console.error('택배 단계 그림 실패(글만 보냅니다):', e.message);
+  }
+  return { payload, delivered, checkpoints };
+}
+
+const PARCEL_KNOWN_ERRORS = { 10: '운송장번호 형식이 올바르지 않아요.', 11: '운송장번호 자릿수가 맞지 않아요.', 12: '이 택배사의 운송장번호 형식이 아니에요. 택배사를 다시 확인해주세요.' };
+
+async function handleParcelAlert(interaction) {
+  const sub = interaction.options.getSubcommand();
+  const uid = interaction.user.id;
+  const list = parcelAlerts.get(uid) || [];
+
+  if (sub === '목록') {
+    if (!list.length) {
+      await interaction.reply({ content: '등록된 정기 배송 알림이 없어요. `/정기배송알림 등록`으로 만들어보세요.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const lines = list.map((e, i) => `\`${i + 1}\` ${PARCEL_COURIERS[e.c] || e.c} \`${e.n}\` — 매일 ${e.t.join(', ')} (하루 ${e.t.length}번)`);
+    await interaction.reply({ content: `📦 **내 정기 배송 알림**\n${lines.join('\n')}\n지우려면 \`/정기배송알림 삭제 번호:1\``, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  if (sub === '삭제') {
+    const idx = interaction.options.getInteger('번호') - 1;
+    if (!list[idx]) {
+      await interaction.reply({ content: '그 번호의 알림이 없어요. `/정기배송알림 목록`으로 번호를 확인해주세요.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const [gone] = list.splice(idx, 1);
+    await saveParcelAlerts(uid);
+    await interaction.reply({ content: `🗑️ ${PARCEL_COURIERS[gone.c] || gone.c} \`${gone.n}\` 알림을 지웠어요.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  // 등록
+  const courier = interaction.options.getString('택배사');
+  const number = interaction.options.getString('운송장번호').replace(/[\s-]/g, '');
+  const times = parseAlertTimes(interaction.options.getString('시간'));
+  if (!/^[A-Za-z0-9]{8,24}$/.test(number)) {
+    await interaction.reply({ content: '운송장번호는 하이픈 없이 숫자(또는 영문 숫자) 8~24자로 입력해주세요.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!times) {
+    await interaction.reply({ content: `알림 시간을 확인해주세요. 하루 최대 ${PARCEL_ALERT_MAX_TIMES}번, 예: \`9\` / \`9, 18\` / \`8:30 13 20\` (한국 시간)`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (list.length >= PARCEL_ALERT_MAX_PER_USER) {
+    await interaction.reply({ content: `정기 알림은 한 사람당 ${PARCEL_ALERT_MAX_PER_USER}개까지예요. 하나를 지우고 다시 등록해주세요.`, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (list.some((e) => e.c === courier && e.n === number)) {
+    await interaction.reply({ content: '이미 등록된 운송장이에요.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  // 1) 택배사·운송장번호가 맞는지 실제로 조회해서 확인
+  let status;
+  try {
+    const result = await traceParcel(courier, number, uid);
+    if (!(result.checkpoints || []).length) {
+      await interaction.editReply(`❌ 등록하지 않았어요. ${PARCEL_COURIERS[courier]}에서 \`${number}\` 배송 정보를 찾을 수 없어요.\n택배사나 운송장번호가 틀렸거나, 아직 택배사에 접수되기 전일 수 있어요. 확인 후 다시 등록해주세요.`);
+      return;
+    }
+    status = await parcelStatusPayload(courier, number, result);
+    if (status.delivered) {
+      await interaction.editReply('❌ 이미 배송이 완료된 택배라서 등록하지 않았어요.');
+      return;
+    }
+  } catch (error) {
+    console.error('정기 배송 알림 확인 오류:', error.code, error.message);
+    await interaction.editReply(`❌ 등록하지 않았어요. ${error.userMessage || PARCEL_KNOWN_ERRORS[error.code] || '택배 정보를 확인하지 못했어요. 택배사와 운송장번호를 확인하거나 잠시 후 다시 시도해주세요.'}`);
+    return;
+  }
+  // 2) DM을 받을 수 있는지 확인 (알림은 DM으로만 가요)
+  try {
+    await interaction.user.send({
+      content: `✅ **정기 배송 알림이 등록됐어요!** 매일 ${times.join(', ')}에 이 DM으로 배송 상태를 알려드릴게요. (배송이 완료되면 자동으로 끝나요)\n지금 상태:`,
+      ...status.payload,
+    });
+  } catch (error) {
+    await interaction.editReply('❌ 등록하지 않았어요. DM을 보낼 수 없어요. 서버 이름 옆 ⋯ → **개인정보 보호 설정** → **다이렉트 메시지 허용**을 켠 뒤 다시 등록해주세요. (알림은 DM으로만 가요)');
+    return;
+  }
+  list.push({ c: courier, n: number, t: times, s: {}, f: 0, at: Date.now() });
+  parcelAlerts.set(uid, list);
+  await saveParcelAlerts(uid);
+  await interaction.editReply(`✅ 등록했어요! 매일 ${times.join(', ')}에 DM으로 알려드려요. 지금 상태도 DM으로 보냈어요.`);
+}
+
+let parcelAlertRunning = false;
+async function checkParcelAlerts() {
+  if (parcelAlertRunning || !client.isReady() || !parcelAlerts.size) return;
+  parcelAlertRunning = true;
+  try {
+    const d = new Date(Date.now() + 9 * 3600000);
+    const dateKey = `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+    const nowMin = d.getUTCHours() * 60 + d.getUTCMinutes();
+    for (const [uid, list] of [...parcelAlerts]) {
+      let changed = false;
+      for (const entry of [...list]) {
+        const drop = () => {
+          list.splice(list.indexOf(entry), 1);
+          changed = true;
+        };
+        if (Date.now() - entry.at > PARCEL_ALERT_LIFETIME_MS) {
+          drop();
+          client.users.send(uid, `📦 ${PARCEL_COURIERS[entry.c] || entry.c} \`${entry.n}\` 정기 알림은 30일이 지나서 끝났어요.`).catch(() => {});
+          continue;
+        }
+        const due = entry.t.find((t) => {
+          const [h, m] = t.split(':').map(Number);
+          return nowMin >= h * 60 + m && nowMin <= h * 60 + m + 30 && entry.s[t] !== dateKey;
+        });
+        if (!due) continue;
+        entry.s = { ...entry.s, [due]: dateKey }; // 실패해도 도배하지 않게 먼저 표시
+        changed = true;
+        try {
+          const result = await traceParcel(entry.c, entry.n, uid);
+          const status = await parcelStatusPayload(entry.c, entry.n, result);
+          entry.f = 0;
+          await client.users.send(uid, { content: status.delivered ? '🎉 **배송이 완료됐어요!** 이 택배의 정기 알림은 여기서 끝낼게요.' : `⏰ 정기 배송 알림 (${due})`, ...status.payload });
+          if (status.delivered) drop();
+        } catch (error) {
+          console.error('정기 배송 알림 오류:', error.code, error.message);
+          if (error.code === 50007) {
+            drop(); // DM을 막아둔 경우 더 보내지 않아요
+            continue;
+          }
+          entry.f = (entry.f || 0) + 1;
+          if (entry.f >= 5) {
+            drop();
+            client.users.send(uid, `📦 ${PARCEL_COURIERS[entry.c] || entry.c} \`${entry.n}\` 조회가 계속 실패해서 정기 알림을 끝냈어요. 다시 등록해주세요.`).catch(() => {});
+          } else {
+            client.users.send(uid, `📦 ${PARCEL_COURIERS[entry.c] || entry.c} \`${entry.n}\` — 이번엔 배송 정보를 못 가져왔어요. (${error.userMessage || '택배사 사이트 문제일 수 있어요'}) 다음 알림 때 다시 시도할게요.`).catch(() => {});
+          }
+        }
+      }
+      if (changed) await saveParcelAlerts(uid).catch((e) => console.error('정기 배송 알림 저장 실패:', e.message));
+    }
+  } finally {
+    parcelAlertRunning = false;
+  }
 }
 
 // ===== 기상청 날씨 (공공데이터포털 단기예보 API) =====
